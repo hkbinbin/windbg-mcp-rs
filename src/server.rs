@@ -7,8 +7,9 @@ use serde_json::{Value, json};
 
 use crate::{
     catalog::{Catalog, CatalogEntry, CatalogResourceKind, CatalogSection},
-    executor::{CommandDispatcher, interrupt_current_session, query_current_session_state},
+    executor::{CommandDispatcher, ExecutionError},
     resources::{GUIDE_URI, render_compact_command, render_full_command, render_guide},
+    session_manager::HeadlessSessionManager,
 };
 
 #[cfg(test)]
@@ -17,13 +18,29 @@ use crate::executor::build_command;
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ExecuteRawArgs {
     command: String,
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
-struct InterruptTargetArgs {}
+struct InterruptTargetArgs {
+    session_id: Option<String>,
+}
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
-struct GetExecutionStateArgs {}
+struct ResumeTargetArgs {
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct GetExecutionStateArgs {
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct GetOutputArgs {
+    session_id: Option<String>,
+    cursor: Option<u64>,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SearchCatalogArgs {
@@ -32,14 +49,56 @@ struct SearchCatalogArgs {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct OpenSessionArgs {
+    connection: String,
+    session_id: Option<String>,
+    startup_command: Option<String>,
+    attach_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CloseSessionArgs {
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SwitchSessionArgs {
+    session_id: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ListSessionsArgs {}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct CurrentSessionArgs {}
+
+#[derive(Clone)]
+enum ServerBackend {
+    AttachedSession { dispatcher: CommandDispatcher },
+    Headless { sessions: HeadlessSessionManager },
+}
+
 #[derive(Clone)]
 pub struct WindbgMcpServer {
-    dispatcher: CommandDispatcher,
+    backend: ServerBackend,
 }
 
 impl WindbgMcpServer {
     pub fn new(dispatcher: CommandDispatcher) -> Self {
-        Self { dispatcher }
+        Self {
+            backend: ServerBackend::AttachedSession { dispatcher },
+        }
+    }
+
+    pub fn headless(sessions: HeadlessSessionManager) -> Self {
+        Self {
+            backend: ServerBackend::Headless { sessions },
+        }
+    }
+
+    fn is_headless(&self) -> bool {
+        matches!(self.backend, ServerBackend::Headless { .. })
     }
 
     fn catalog(&self) -> &'static Catalog {
@@ -57,7 +116,7 @@ impl WindbgMcpServer {
     fn generic_command_tool(&self) -> Tool {
         Tool::new(
             "windbg_execute_command",
-            "Execute a WinDbg command string through dbgeng. The debugger must already be ready for commands; query state first and interrupt explicitly when needed.",
+            "Execute a WinDbg command string through dbgeng. Query state first and interrupt explicitly when needed. In headless mode, `session_id` routes the call to a specific attached session.",
             schema_for_type::<ExecuteRawArgs>(),
         )
         .with_title("Execute WinDbg command")
@@ -66,19 +125,37 @@ impl WindbgMcpServer {
     fn state_tool(&self) -> Tool {
         Tool::new(
             "windbg_get_execution_state",
-            "Query the current debugger execution state before deciding whether to interrupt or execute a command.",
+            "Query the current debugger execution state before deciding whether to interrupt, resume, or execute a command. In headless mode, `session_id` routes the call to a specific session.",
             schema_for_type::<GetExecutionStateArgs>(),
         )
         .with_title("Get debugger execution state")
     }
 
+    fn output_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_get_output",
+            "Read the buffered debugger command output history for the current session. Pass the last returned `next_cursor` to fetch only newer entries. In headless mode, `session_id` routes the call to a specific session.",
+            schema_for_type::<GetOutputArgs>(),
+        )
+        .with_title("Get debugger output")
+    }
+
     fn interrupt_tool(&self) -> Tool {
         Tool::new(
             "windbg_interrupt_target",
-            "Request a debugger break into the currently running target and wait until debugger commands are accepted again.",
+            "Request a debugger break into the currently running target and wait until debugger commands are accepted again. In headless mode, `session_id` routes the call to a specific session.",
             schema_for_type::<InterruptTargetArgs>(),
         )
         .with_title("Interrupt running target")
+    }
+
+    fn resume_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_resume_target",
+            "Resume the current target without issuing a text command. This is the safe headless equivalent of continuing execution after an initial break. In headless mode, `session_id` routes the call to a specific session.",
+            schema_for_type::<ResumeTargetArgs>(),
+        )
+        .with_title("Resume target")
     }
 
     fn search_tool(&self) -> Tool {
@@ -88,6 +165,51 @@ impl WindbgMcpServer {
             schema_for_type::<SearchCatalogArgs>(),
         )
         .with_title("Search WinDbg catalog")
+    }
+
+    fn open_session_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_open_session",
+            "Open a headless kernel-debug session using the same connection options you would pass to `-k`, for example `net:port=50000,key=...`. Full launcher strings like `windbgx -k net:...` are also accepted.",
+            schema_for_type::<OpenSessionArgs>(),
+        )
+        .with_title("Open headless session")
+    }
+
+    fn close_session_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_close_session",
+            "Close a headless debugger session and detach the owned dbgeng client from the target.",
+            schema_for_type::<CloseSessionArgs>(),
+        )
+        .with_title("Close headless session")
+    }
+
+    fn switch_session_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_switch_session",
+            "Set the default headless session used when `session_id` is omitted from tool calls.",
+            schema_for_type::<SwitchSessionArgs>(),
+        )
+        .with_title("Switch default session")
+    }
+
+    fn list_sessions_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_list_sessions",
+            "List all headless debugger sessions managed by this MCP server.",
+            schema_for_type::<ListSessionsArgs>(),
+        )
+        .with_title("List headless sessions")
+    }
+
+    fn current_session_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_current_session",
+            "Show the current default headless debugger session.",
+            schema_for_type::<CurrentSessionArgs>(),
+        )
+        .with_title("Get current headless session")
     }
 
     fn syntax_preview(&self, entry: &CatalogEntry) -> Option<String> {
@@ -109,6 +231,132 @@ impl WindbgMcpServer {
         }
     }
 
+    fn base_tools(&self) -> Vec<Tool> {
+        vec![
+            self.generic_command_tool(),
+            self.state_tool(),
+            self.output_tool(),
+            self.search_tool(),
+            self.interrupt_tool(),
+            self.resume_tool(),
+        ]
+    }
+
+    fn management_tools(&self) -> Vec<Tool> {
+        if !self.is_headless() {
+            return Vec::new();
+        }
+
+        vec![
+            self.open_session_tool(),
+            self.close_session_tool(),
+            self.switch_session_tool(),
+            self.list_sessions_tool(),
+            self.current_session_tool(),
+        ]
+    }
+
+    fn map_execution_error(error: ExecutionError) -> McpError {
+        match error {
+            ExecutionError::Session(_) | ExecutionError::InvalidVariant { .. } => {
+                McpError::invalid_params(error.to_string(), None)
+            }
+            _ => McpError::internal_error(error.to_string(), None),
+        }
+    }
+
+    async fn execute_command(
+        &self,
+        session_id: Option<&str>,
+        command: String,
+    ) -> Result<Value, McpError> {
+        let execution = match &self.backend {
+            ServerBackend::AttachedSession { dispatcher } => dispatcher
+                .execute(command.clone())
+                .await
+                .map_err(Self::map_execution_error)?,
+            ServerBackend::Headless { sessions } => sessions
+                .execute_command(session_id, command.clone())
+                .await
+                .map_err(Self::map_execution_error)?,
+        };
+
+        Ok(json!({
+            "command": execution.command,
+            "output": execution.output,
+            "state_before": execution.state_before,
+            "state_after": execution.state_after,
+        }))
+    }
+
+    async fn query_state(&self, session_id: Option<&str>) -> Result<Value, McpError> {
+        let state = match &self.backend {
+            ServerBackend::AttachedSession { dispatcher } => dispatcher
+                .query_state()
+                .await
+                .map_err(Self::map_execution_error)?,
+            ServerBackend::Headless { sessions } => sessions
+                .query_state(session_id)
+                .await
+                .map_err(Self::map_execution_error)?,
+        };
+
+        Ok(json!({ "state": state }))
+    }
+
+    async fn get_output(
+        &self,
+        session_id: Option<&str>,
+        cursor: Option<u64>,
+    ) -> Result<Value, McpError> {
+        let snapshot = match &self.backend {
+            ServerBackend::AttachedSession { dispatcher } => dispatcher
+                .get_output(cursor)
+                .await
+                .map_err(Self::map_execution_error)?,
+            ServerBackend::Headless { sessions } => sessions
+                .get_output(session_id, cursor)
+                .await
+                .map_err(Self::map_execution_error)?,
+        };
+
+        Ok(json!({
+            "entries": snapshot.entries,
+            "history_start_cursor": snapshot.history_start_cursor,
+            "next_cursor": snapshot.next_cursor,
+        }))
+    }
+
+    async fn interrupt_target(&self, session_id: Option<&str>) -> Result<Value, McpError> {
+        let state = match &self.backend {
+            ServerBackend::AttachedSession { dispatcher } => dispatcher
+                .interrupt()
+                .await
+                .map_err(Self::map_execution_error)?,
+            ServerBackend::Headless { sessions } => sessions
+                .interrupt(session_id)
+                .await
+                .map_err(Self::map_execution_error)?,
+        };
+
+        Ok(json!({ "state": state }))
+    }
+
+    async fn resume_target(&self, session_id: Option<&str>) -> Result<Value, McpError> {
+        let state = match &self.backend {
+            ServerBackend::AttachedSession { dispatcher } => dispatcher
+                .resume()
+                .await
+                .map_err(Self::map_execution_error)?,
+            ServerBackend::Headless { sessions } => sessions
+                .resume(session_id)
+                .await
+                .map_err(Self::map_execution_error)?,
+        };
+
+        Ok(json!({ "state": state }))
+    }
+
     #[cfg(test)]
     async fn run_entry_tool(
         &self,
@@ -127,11 +375,18 @@ impl WindbgMcpServer {
 
         let command = build_command(entry, variant, arguments)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let execution = self
-            .dispatcher
-            .execute(command.clone())
-            .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let execution = match &self.backend {
+            ServerBackend::AttachedSession { dispatcher } => dispatcher
+                .execute(command.clone())
+                .await
+                .map_err(Self::map_execution_error)?,
+            ServerBackend::Headless { .. } => {
+                return Err(McpError::internal_error(
+                    "test-only helper is only implemented for attached-session mode",
+                    None,
+                ));
+            }
+        };
 
         Ok(CallToolResult::structured(json!({
             "entry_id": entry.id,
@@ -146,15 +401,19 @@ impl WindbgMcpServer {
 
 impl ServerHandler for WindbgMcpServer {
     fn get_info(&self) -> ServerInfo {
+        let instructions = if self.is_headless() {
+            "Open a session with `windbg_open_session` before using debugger actions. Then call `windbg_search_catalog`, read `windbg://command/{id}`, call `windbg_get_execution_state`, interrupt if needed, and only then call `windbg_execute_command`. Use `windbg_get_output` with the returned cursor to fetch buffered command output incrementally. Use `windbg_resume_target` to continue a live target without blocking on a raw `g` command. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
+        } else {
+            "This server is organized around low-context resources plus a small toolset. Start with `windbg_search_catalog`, read `windbg://command/{id}`, optionally escalate to `windbg://command-full/{id}`, then call `windbg_get_execution_state`. If the debugger is running or busy, call `windbg_interrupt_target` and verify state again before calling `windbg_execute_command`. Use `windbg_get_output` to read buffered command output again later, and `windbg_resume_target` to continue execution without issuing a raw `g` command."
+        };
+
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_resources()
                 .enable_tools()
                 .build(),
         )
-        .with_instructions(
-            "This server is organized around low-context resources plus a small toolset. Start with `windbg_search_catalog`, read `windbg://command/{id}`, optionally escalate to `windbg://command-full/{id}`, then call `windbg_get_execution_state`. If the debugger is running or busy, call `windbg_interrupt_target` and verify state again before calling `windbg_execute_command`.",
-        )
+        .with_instructions(instructions)
     }
 
     async fn list_tools(
@@ -162,13 +421,11 @@ impl ServerHandler for WindbgMcpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let mut tools = self.management_tools();
+        tools.extend(self.base_tools());
+
         Ok(ListToolsResult {
-            tools: vec![
-                self.generic_command_tool(),
-                self.state_tool(),
-                self.search_tool(),
-                self.interrupt_tool(),
-            ],
+            tools,
             next_cursor: None,
             meta: None,
         })
@@ -178,8 +435,15 @@ impl ServerHandler for WindbgMcpServer {
         match name {
             "windbg_execute_command" => Some(self.generic_command_tool()),
             "windbg_get_execution_state" => Some(self.state_tool()),
+            "windbg_get_output" => Some(self.output_tool()),
             "windbg_search_catalog" => Some(self.search_tool()),
             "windbg_interrupt_target" => Some(self.interrupt_tool()),
+            "windbg_resume_target" => Some(self.resume_tool()),
+            "windbg_open_session" if self.is_headless() => Some(self.open_session_tool()),
+            "windbg_close_session" if self.is_headless() => Some(self.close_session_tool()),
+            "windbg_switch_session" if self.is_headless() => Some(self.switch_session_tool()),
+            "windbg_list_sessions" if self.is_headless() => Some(self.list_sessions_tool()),
+            "windbg_current_session" if self.is_headless() => Some(self.current_session_tool()),
             _ => None,
         }
     }
@@ -192,25 +456,22 @@ impl ServerHandler for WindbgMcpServer {
         match request.name.as_ref() {
             "windbg_execute_command" => {
                 let args: ExecuteRawArgs = self.parse_arguments(request.arguments)?;
-                let execution = self
-                    .dispatcher
-                    .execute(args.command.clone())
-                    .await
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                Ok(CallToolResult::structured(json!({
-                    "command": execution.command,
-                    "output": execution.output,
-                    "state_before": execution.state_before,
-                    "state_after": execution.state_after,
-                })))
+                let payload = self
+                    .execute_command(args.session_id.as_deref(), args.command)
+                    .await?;
+                Ok(CallToolResult::structured(payload))
             }
             "windbg_get_execution_state" => {
-                let _: GetExecutionStateArgs = self.parse_arguments(request.arguments)?;
-                let state = query_current_session_state()
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                Ok(CallToolResult::structured(json!({
-                    "state": state,
-                })))
+                let args: GetExecutionStateArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.query_state(args.session_id.as_deref()).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_get_output" => {
+                let args: GetOutputArgs = self.parse_arguments(request.arguments)?;
+                let payload = self
+                    .get_output(args.session_id.as_deref(), args.cursor)
+                    .await?;
+                Ok(CallToolResult::structured(payload))
             }
             "windbg_search_catalog" => {
                 let args: SearchCatalogArgs = self.parse_arguments(request.arguments)?;
@@ -232,6 +493,7 @@ impl ServerHandler for WindbgMcpServer {
                             "routing": entry.tool_routing_name(),
                             "recommended_tool": entry.recommended_tool(),
                             "execution_state_tool": "windbg_get_execution_state",
+                            "resume_tool": "windbg_resume_target"
                         })
                     })
                     .collect();
@@ -249,11 +511,79 @@ impl ServerHandler for WindbgMcpServer {
                 })))
             }
             "windbg_interrupt_target" => {
-                let _: InterruptTargetArgs = self.parse_arguments(request.arguments)?;
-                let state = interrupt_current_session()
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                let args: InterruptTargetArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.interrupt_target(args.session_id.as_deref()).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_resume_target" => {
+                let args: ResumeTargetArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.resume_target(args.session_id.as_deref()).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_open_session" => {
+                let ServerBackend::Headless { sessions } = &self.backend else {
+                    return Err(McpError::method_not_found::<CallToolRequestMethod>());
+                };
+                let args: OpenSessionArgs = self.parse_arguments(request.arguments)?;
+                let session = sessions
+                    .open_kernel_session(
+                        &args.connection,
+                        args.session_id.as_deref(),
+                        args.startup_command.as_deref(),
+                        args.attach_timeout_secs,
+                    )
+                    .await
+                    .map_err(Self::map_execution_error)?;
                 Ok(CallToolResult::structured(json!({
-                    "state": state,
+                    "session": session
+                })))
+            }
+            "windbg_close_session" => {
+                let ServerBackend::Headless { sessions } = &self.backend else {
+                    return Err(McpError::method_not_found::<CallToolRequestMethod>());
+                };
+                let args: CloseSessionArgs = self.parse_arguments(request.arguments)?;
+                let result = sessions
+                    .close_session(&args.session_id)
+                    .await
+                    .map_err(Self::map_execution_error)?;
+                Ok(CallToolResult::structured(json!(result)))
+            }
+            "windbg_switch_session" => {
+                let ServerBackend::Headless { sessions } = &self.backend else {
+                    return Err(McpError::method_not_found::<CallToolRequestMethod>());
+                };
+                let args: SwitchSessionArgs = self.parse_arguments(request.arguments)?;
+                let session = sessions
+                    .switch_session(&args.session_id)
+                    .await
+                    .map_err(Self::map_execution_error)?;
+                Ok(CallToolResult::structured(json!({
+                    "session": session
+                })))
+            }
+            "windbg_list_sessions" => {
+                let ServerBackend::Headless { sessions } = &self.backend else {
+                    return Err(McpError::method_not_found::<CallToolRequestMethod>());
+                };
+                let _: ListSessionsArgs = self.parse_arguments(request.arguments)?;
+                let payload = sessions
+                    .list_sessions()
+                    .await
+                    .map_err(Self::map_execution_error)?;
+                Ok(CallToolResult::structured(json!(payload)))
+            }
+            "windbg_current_session" => {
+                let ServerBackend::Headless { sessions } = &self.backend else {
+                    return Err(McpError::method_not_found::<CallToolRequestMethod>());
+                };
+                let _: CurrentSessionArgs = self.parse_arguments(request.arguments)?;
+                let payload = sessions
+                    .current_session()
+                    .await
+                    .map_err(Self::map_execution_error)?;
+                Ok(CallToolResult::structured(json!({
+                    "session": payload
                 })))
             }
             _ => Err(McpError::method_not_found::<CallToolRequestMethod>()),
@@ -391,6 +721,20 @@ mod tests {
             .get_tool("windbg_interrupt_target")
             .expect("interrupt tool should be listed");
         assert_eq!(tool.name, "windbg_interrupt_target");
+    }
+
+    #[test]
+    fn resume_tool_is_exposed() {
+        let dispatcher = CommandDispatcher::spawn(ExecutionMode::Mock {
+            responses: HashMap::new(),
+        })
+        .expect("dispatcher should start");
+        let server = WindbgMcpServer::new(dispatcher);
+
+        let tool = server
+            .get_tool("windbg_resume_target")
+            .expect("resume tool should be listed");
+        assert_eq!(tool.name, "windbg_resume_target");
     }
 
     #[test]

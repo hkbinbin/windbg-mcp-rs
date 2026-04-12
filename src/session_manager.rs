@@ -1,0 +1,499 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use serde::Serialize;
+
+use crate::executor::{
+    CommandDispatcher, CommandExecutionResult, DebuggerExecutionState, ExecutionError,
+    ExecutionMode, OutputSnapshot, default_attach_timeout,
+};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HeadlessSessionInfo {
+    pub session_id: String,
+    pub transport: String,
+    pub connection_options: String,
+    pub startup_command: Option<String>,
+    pub created_at_unix_ms: u64,
+    pub last_accessed_unix_ms: u64,
+    pub is_default: bool,
+    pub state: Option<DebuggerExecutionState>,
+    pub state_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HeadlessSessionList {
+    pub default_session_id: Option<String>,
+    pub sessions: Vec<HeadlessSessionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CloseSessionResult {
+    pub closed_session_id: String,
+    pub default_session_id: Option<String>,
+    pub remaining_sessions: usize,
+}
+
+#[derive(Clone, Default)]
+pub struct HeadlessSessionManager {
+    inner: Arc<Mutex<SessionRegistry>>,
+}
+
+struct SessionRegistry {
+    sessions: HashMap<String, ManagedSession>,
+    by_connection: HashMap<String, String>,
+    default_session_id: Option<String>,
+    next_session_number: u64,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            by_connection: HashMap::new(),
+            default_session_id: None,
+            next_session_number: 1,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ManagedSession {
+    session_id: String,
+    transport: String,
+    connection_options: String,
+    startup_command: Option<String>,
+    created_at_unix_ms: u64,
+    last_accessed_unix_ms: u64,
+    dispatcher: CommandDispatcher,
+}
+
+#[derive(Clone)]
+struct ManagedSessionSnapshot {
+    session_id: String,
+    transport: String,
+    connection_options: String,
+    startup_command: Option<String>,
+    created_at_unix_ms: u64,
+    last_accessed_unix_ms: u64,
+    is_default: bool,
+    dispatcher: CommandDispatcher,
+}
+
+impl HeadlessSessionManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn open_kernel_session(
+        &self,
+        connect_options: impl AsRef<str>,
+        session_id: Option<&str>,
+        startup_command: Option<&str>,
+        attach_timeout_secs: Option<u64>,
+    ) -> Result<HeadlessSessionInfo, ExecutionError> {
+        let normalized = normalize_kernel_connect_options(connect_options.as_ref())?;
+        let startup_command = startup_command
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        let session_id = {
+            let mut registry = self
+                .inner
+                .lock()
+                .expect("headless session registry lock poisoned");
+
+            if let Some(existing_id) = registry.by_connection.get(&normalized).cloned() {
+                if let Some(requested) = session_id
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .filter(|requested| *requested != existing_id)
+                {
+                    return Err(ExecutionError::Session(format!(
+                        "connection `{normalized}` is already open as session `{existing_id}` and cannot be re-opened as `{requested}`"
+                    )));
+                }
+
+                registry.default_session_id = Some(existing_id.clone());
+                if let Some(existing) = registry.sessions.get_mut(&existing_id) {
+                    existing.last_accessed_unix_ms = timestamp_now_ms();
+                }
+                existing_id
+            } else {
+                let session_id = match session_id.map(str::trim).filter(|value| !value.is_empty()) {
+                    Some(requested) => {
+                        if registry.sessions.contains_key(requested) {
+                            return Err(ExecutionError::Session(format!(
+                                "session `{requested}` already exists"
+                            )));
+                        }
+                        requested.to_string()
+                    }
+                    None => {
+                        let generated = format!("session-{:02}", registry.next_session_number);
+                        registry.next_session_number += 1;
+                        generated
+                    }
+                };
+
+                let attach_timeout = Duration::from_secs(
+                    attach_timeout_secs.unwrap_or(default_attach_timeout().as_secs()),
+                );
+                let dispatcher = CommandDispatcher::spawn(ExecutionMode::KernelConnection {
+                    connect_options: normalized.clone(),
+                    startup_command: startup_command.clone(),
+                    attach_timeout,
+                })?;
+                let now = timestamp_now_ms();
+                registry
+                    .by_connection
+                    .insert(normalized.clone(), session_id.clone());
+                registry.sessions.insert(
+                    session_id.clone(),
+                    ManagedSession {
+                        session_id: session_id.clone(),
+                        transport: "kernel".to_string(),
+                        connection_options: normalized,
+                        startup_command,
+                        created_at_unix_ms: now,
+                        last_accessed_unix_ms: now,
+                        dispatcher,
+                    },
+                );
+                registry.default_session_id = Some(session_id.clone());
+                session_id
+            }
+        };
+
+        self.describe_session(&session_id).await
+    }
+
+    pub async fn close_session(
+        &self,
+        session_id: &str,
+    ) -> Result<CloseSessionResult, ExecutionError> {
+        let (dispatcher, session_id, default_session_id, remaining_sessions) = {
+            let mut registry = self
+                .inner
+                .lock()
+                .expect("headless session registry lock poisoned");
+            let Some(removed) = registry.sessions.remove(session_id) else {
+                return Err(ExecutionError::Session(session_id.to_string()));
+            };
+            registry.by_connection.remove(&removed.connection_options);
+            if registry.default_session_id.as_deref() == Some(session_id) {
+                registry.default_session_id = registry.sessions.keys().next().cloned();
+            }
+            let default_session_id = registry.default_session_id.clone();
+            let remaining_sessions = registry.sessions.len();
+            (
+                removed.dispatcher,
+                removed.session_id,
+                default_session_id,
+                remaining_sessions,
+            )
+        };
+
+        dispatcher.shutdown().await?;
+
+        Ok(CloseSessionResult {
+            closed_session_id: session_id,
+            default_session_id,
+            remaining_sessions,
+        })
+    }
+
+    pub async fn switch_session(
+        &self,
+        session_id: &str,
+    ) -> Result<HeadlessSessionInfo, ExecutionError> {
+        {
+            let mut registry = self
+                .inner
+                .lock()
+                .expect("headless session registry lock poisoned");
+            if !registry.sessions.contains_key(session_id) {
+                return Err(ExecutionError::Session(session_id.to_string()));
+            }
+            registry.default_session_id = Some(session_id.to_string());
+            if let Some(session) = registry.sessions.get_mut(session_id) {
+                session.last_accessed_unix_ms = timestamp_now_ms();
+            }
+        }
+
+        self.describe_session(session_id).await
+    }
+
+    pub async fn list_sessions(&self) -> Result<HeadlessSessionList, ExecutionError> {
+        let (default_session_id, session_ids) = {
+            let registry = self
+                .inner
+                .lock()
+                .expect("headless session registry lock poisoned");
+            let mut session_ids: Vec<String> = registry.sessions.keys().cloned().collect();
+            session_ids.sort();
+            (registry.default_session_id.clone(), session_ids)
+        };
+
+        let mut sessions = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            sessions.push(self.describe_session(&session_id).await?);
+        }
+
+        Ok(HeadlessSessionList {
+            default_session_id,
+            sessions,
+        })
+    }
+
+    pub async fn current_session(&self) -> Result<Option<HeadlessSessionInfo>, ExecutionError> {
+        let session_id = {
+            let registry = self
+                .inner
+                .lock()
+                .expect("headless session registry lock poisoned");
+            registry.default_session_id.clone()
+        };
+
+        match session_id {
+            Some(session_id) => Ok(Some(self.describe_session(&session_id).await?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn execute_command(
+        &self,
+        session_id: Option<&str>,
+        command: String,
+    ) -> Result<CommandExecutionResult, ExecutionError> {
+        let (session_id, dispatcher) = self.resolve_dispatcher(session_id)?;
+        let result = dispatcher.execute(command).await?;
+        self.touch_session(&session_id);
+        Ok(result)
+    }
+
+    pub async fn query_state(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<DebuggerExecutionState, ExecutionError> {
+        let (session_id, dispatcher) = self.resolve_dispatcher(session_id)?;
+        let result = dispatcher.query_state().await?;
+        self.touch_session(&session_id);
+        Ok(result)
+    }
+
+    pub async fn interrupt(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<DebuggerExecutionState, ExecutionError> {
+        let (session_id, dispatcher) = self.resolve_dispatcher(session_id)?;
+        let result = dispatcher.interrupt().await?;
+        self.touch_session(&session_id);
+        Ok(result)
+    }
+
+    pub async fn resume(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<DebuggerExecutionState, ExecutionError> {
+        let (session_id, dispatcher) = self.resolve_dispatcher(session_id)?;
+        let result = dispatcher.resume().await?;
+        self.touch_session(&session_id);
+        Ok(result)
+    }
+
+    pub async fn get_output(
+        &self,
+        session_id: Option<&str>,
+        cursor: Option<u64>,
+    ) -> Result<OutputSnapshot, ExecutionError> {
+        let (session_id, dispatcher) = self.resolve_dispatcher(session_id)?;
+        let result = dispatcher.get_output(cursor).await?;
+        self.touch_session(&session_id);
+        Ok(result)
+    }
+
+    fn resolve_dispatcher(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<(String, CommandDispatcher), ExecutionError> {
+        let registry = self
+            .inner
+            .lock()
+            .expect("headless session registry lock poisoned");
+
+        let resolved_id = match session_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(requested) => requested.to_string(),
+            None => registry.default_session_id.clone().ok_or_else(|| {
+                ExecutionError::Session(
+                    "no active session; call `windbg_open_session` first".to_string(),
+                )
+            })?,
+        };
+
+        let session = registry
+            .sessions
+            .get(&resolved_id)
+            .ok_or_else(|| ExecutionError::Session(resolved_id.clone()))?;
+
+        Ok((resolved_id, session.dispatcher.clone()))
+    }
+
+    fn describe_session_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<ManagedSessionSnapshot, ExecutionError> {
+        let registry = self
+            .inner
+            .lock()
+            .expect("headless session registry lock poisoned");
+        let session = registry
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| ExecutionError::Session(session_id.to_string()))?;
+
+        Ok(ManagedSessionSnapshot {
+            session_id: session.session_id.clone(),
+            transport: session.transport.clone(),
+            connection_options: session.connection_options.clone(),
+            startup_command: session.startup_command.clone(),
+            created_at_unix_ms: session.created_at_unix_ms,
+            last_accessed_unix_ms: session.last_accessed_unix_ms,
+            is_default: registry.default_session_id.as_deref() == Some(session_id),
+            dispatcher: session.dispatcher.clone(),
+        })
+    }
+
+    async fn describe_session(
+        &self,
+        session_id: &str,
+    ) -> Result<HeadlessSessionInfo, ExecutionError> {
+        let snapshot = self.describe_session_snapshot(session_id)?;
+        let (state, state_error) = match snapshot.dispatcher.query_state().await {
+            Ok(state) => (Some(state), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+
+        Ok(HeadlessSessionInfo {
+            session_id: snapshot.session_id,
+            transport: snapshot.transport,
+            connection_options: snapshot.connection_options,
+            startup_command: snapshot.startup_command,
+            created_at_unix_ms: snapshot.created_at_unix_ms,
+            last_accessed_unix_ms: snapshot.last_accessed_unix_ms,
+            is_default: snapshot.is_default,
+            state,
+            state_error,
+        })
+    }
+
+    fn touch_session(&self, session_id: &str) {
+        let mut registry = self
+            .inner
+            .lock()
+            .expect("headless session registry lock poisoned");
+        if let Some(session) = registry.sessions.get_mut(session_id) {
+            session.last_accessed_unix_ms = timestamp_now_ms();
+        }
+    }
+
+    #[cfg(test)]
+    async fn open_mock_session(
+        &self,
+        session_id: &str,
+        responses: HashMap<String, String>,
+    ) -> Result<HeadlessSessionInfo, ExecutionError> {
+        let dispatcher = CommandDispatcher::spawn(ExecutionMode::Mock { responses })?;
+        {
+            let mut registry = self
+                .inner
+                .lock()
+                .expect("headless session registry lock poisoned");
+            let now = timestamp_now_ms();
+            registry.sessions.insert(
+                session_id.to_string(),
+                ManagedSession {
+                    session_id: session_id.to_string(),
+                    transport: "mock".to_string(),
+                    connection_options: "mock".to_string(),
+                    startup_command: None,
+                    created_at_unix_ms: now,
+                    last_accessed_unix_ms: now,
+                    dispatcher,
+                },
+            );
+            registry.default_session_id = Some(session_id.to_string());
+        }
+
+        self.describe_session(session_id).await
+    }
+}
+
+fn timestamp_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn normalize_kernel_connect_options(raw: &str) -> Result<String, ExecutionError> {
+    let normalized_dashes = raw.replace(['–', '—'], "-");
+    let trimmed = normalized_dashes.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return Err(ExecutionError::Session(
+            "kernel connection options cannot be empty".to_string(),
+        ));
+    }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err(ExecutionError::Session(
+            "kernel connection options cannot be empty".to_string(),
+        ));
+    }
+
+    if tokens.len() >= 3 && tokens[1].eq_ignore_ascii_case("-k") {
+        return Ok(tokens[2..].join(" "));
+    }
+
+    if tokens.len() >= 2 && tokens[0].eq_ignore_ascii_case("-k") {
+        return Ok(tokens[1..].join(" "));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn manager_routes_commands_to_the_default_mock_session() {
+        let manager = HeadlessSessionManager::new();
+        manager
+            .open_mock_session(
+                "session-01",
+                HashMap::from([("r".to_string(), "register dump".to_string())]),
+            )
+            .await
+            .expect("mock session should open");
+
+        let result = manager
+            .execute_command(None, "r".to_string())
+            .await
+            .expect("command should execute");
+        assert_eq!(result.output, "register dump");
+    }
+
+    #[tokio::test]
+    async fn normalize_strips_windbg_launcher_prefix() {
+        let normalized =
+            normalize_kernel_connect_options("windbgx –k net:port=50000,key=abc,target=10.0.0.5")
+                .expect("normalization should work");
+        assert_eq!(normalized, "net:port=50000,key=abc,target=10.0.0.5");
+    }
+}

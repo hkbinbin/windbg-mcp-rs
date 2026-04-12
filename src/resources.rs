@@ -16,7 +16,7 @@ pub fn render_guide(catalog: &Catalog) -> String {
     output.push_str("4. Call `windbg_get_execution_state` before execution.\n");
     output.push_str("5. If the debugger is running or busy, call `windbg_interrupt_target`, then re-check state.\n");
     output.push_str(
-        "6. Call `windbg_execute_command` only when the debugger is ready for commands.\n\n",
+        "6. Call `windbg_execute_command` only when the debugger is ready for commands. Use `windbg_resume_target` when you want to continue execution without blocking on a raw `g` command.\n\n",
     );
     output.push_str("Key resources\n");
     output.push_str("-------------\n");
@@ -34,6 +34,7 @@ pub fn render_guide(catalog: &Catalog) -> String {
     output.push_str("- windbg_search_catalog\n");
     output.push_str("- windbg_get_execution_state\n");
     output.push_str("- windbg_interrupt_target\n");
+    output.push_str("- windbg_resume_target\n");
     output.push_str("- windbg_execute_command\n\n");
     output.push_str(&catalog.render_index());
     output
@@ -66,7 +67,7 @@ pub fn render_compact_command(entry: &CatalogEntry) -> String {
     output.push_str("\nNext Step\n---------\n");
     match entry.tool_routing() {
         ToolRouting::ExecuteCommand => output.push_str(
-            "Build the final WinDbg command string from the syntax above, call `windbg_get_execution_state`, interrupt if needed, and then call `windbg_execute_command`.\n",
+            "Build the final WinDbg command string from the syntax above, call `windbg_get_execution_state`, interrupt if needed, and then call `windbg_execute_command`. Use `windbg_resume_target` when you want to continue execution without issuing a raw `g` command.\n",
         ),
         ToolRouting::InterruptTarget => output.push_str(
             "This topic maps to an engine-level break action. Use `windbg_interrupt_target` instead of `windbg_execute_command`.\n",
