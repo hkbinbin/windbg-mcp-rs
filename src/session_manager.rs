@@ -262,6 +262,29 @@ impl HeadlessSessionManager {
         })
     }
 
+    pub async fn close_all_sessions(
+        &self,
+        shutdown_timeout_secs: Option<u64>,
+        resume_before_close: Option<bool>,
+    ) -> Vec<Result<CloseSessionResult, ExecutionError>> {
+        let session_ids: Vec<String> = {
+            let registry = self
+                .inner
+                .lock()
+                .expect("headless session registry lock poisoned");
+            registry.sessions.keys().cloned().collect()
+        };
+
+        let mut results = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            results.push(
+                self.close_session(&session_id, shutdown_timeout_secs, resume_before_close)
+                    .await,
+            );
+        }
+        results
+    }
+
     pub async fn switch_session(
         &self,
         session_id: &str,
@@ -567,6 +590,9 @@ async fn resume_session_before_close(
     };
 
     if state.running {
+        if transport == "kernel" {
+            sleep(DEFAULT_KERNEL_CLOSE_POST_RESUME_DELAY).await;
+        }
         return (false, None);
     }
 

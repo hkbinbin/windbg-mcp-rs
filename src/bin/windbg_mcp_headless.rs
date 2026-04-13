@@ -68,13 +68,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let cleanup_sessions = sessions.clone();
     let server = WindbgMcpServer::headless(sessions);
-    if let Some(listen) = cli.listen.as_deref() {
-        run_http(server, listen).await?;
+    let result = if let Some(listen) = cli.listen.as_deref() {
+        run_http(server, listen).await
     } else {
         let service = server.serve(stdio()).await?;
-        service.waiting().await?;
+        service
+            .waiting()
+            .await
+            .map(|_| ())
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+    };
+
+    for close_result in cleanup_sessions
+        .close_all_sessions(Some(12), Some(true))
+        .await
+    {
+        match close_result {
+            Ok(result) => tracing::info!(
+                session_id = %result.closed_session_id,
+                resume_attempted = result.resume_attempted,
+                shutdown_completed = result.shutdown_completed,
+                "cleaned up headless session during server shutdown"
+            ),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to clean up headless session during server shutdown")
+            }
+        }
     }
+
+    result?;
 
     Ok(())
 }

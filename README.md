@@ -116,8 +116,9 @@ Live-target control is split into explicit tools:
 - `windbg_resume_target`
 - `windbg_execute_command`
 - `windbg_prepare_symbols`
+- `windbg_diagnose_extensions`
 
-`windbg_close_session` tries to resume a broken target before teardown by default; pass `resume_before_close: false` to skip that behavior. For live kernel sessions, close waits briefly after an automatic resume before detaching so the guest has time to leave the break state. It also accepts an optional `shutdown_timeout_secs` value. The session is removed from the MCP registry first, and the bounded shutdown result reports whether dbgeng teardown completed cleanly or timed out in the background. This keeps live KDNET detach issues from hanging the MCP server.
+`windbg_close_session` tries to resume a broken target before teardown by default; pass `resume_before_close: false` to skip that behavior. For live kernel sessions, close waits briefly before detaching after either an automatic resume or a recently observed running state, so the guest has time to leave the break state. It also accepts an optional `shutdown_timeout_secs` value. The session is removed from the MCP registry first, and the bounded shutdown result reports whether dbgeng teardown completed cleanly or timed out in the background. This keeps live KDNET detach issues from hanging the MCP server.
 
 `windbg_recover_session` is the safe recovery shortcut for long-running KDNET work: by default it checks the session state and resumes a broken target, returning structured before/after state and any recovery error. Set `interrupt_if_running: true` when you intentionally want the recovery action to break into a running target instead.
 
@@ -143,16 +144,18 @@ By default, live KDNET sessions keep using the system `dbgeng.dll`, which has be
 
 Extension-backed commands still depend on symbols. Use `windbg_prepare_symbols` before commands such as `!process 0 0` or `!drvobj ShadowGate 7` when the target reports incorrect NT symbols. The tool reads `!lmi <module>`, downloads the exact CodeView PDB from the configured symbol server, appends the exact PDB directory to `.sympath`, and reloads the module. It defaults to module `nt`, cache directory `C:\Symbols`, and `https://msdl.microsoft.com/download/symbols`; override the cache per call with `symbol_cache` or globally with `WINDBG_MCP_SYMBOL_CACHE`.
 
+If extension loading or an extension-backed command still fails, call `windbg_diagnose_extensions`. It collects the effective `.extpath`, loaded extension chain, optional symbol preparation, extension load output, probe command output, and remediation hints without requiring the client to manually stitch those checks together.
+
 ## What MCP Exposes
 
 - `Resources`: a low-context guide resource and compact/full WinDbg command documentation resources
-- `Tools`: a compact toolset for catalog search, execution-state query, command execution, target interrupt/resume, exact PDB preparation, and headless session management
+- `Tools`: a compact toolset for catalog search, execution-state query, command execution, target interrupt/resume, exact PDB preparation, extension diagnostics, and headless session management
 
 Pure UI shortcut topics remain available as documentation, and command execution is exposed through a single `windbg_execute_command` tool.
 
 Recommended agent flow in plugin mode: call `windbg_search_catalog`, read `windbg://command/{id}`, fall back to `windbg://command-full/{id}` only when needed, call `windbg_get_execution_state`, and then call `windbg_execute_command`.
 
-Recommended agent flow in headless mode: call `windbg_open_session`, optionally `windbg_switch_session`, then follow the same command flow. If extension commands need kernel symbols, call `windbg_prepare_symbols` while broken into the target. If the debugger is running or busy, call `windbg_interrupt_target` explicitly and verify state again before executing the command. Use `windbg_resume_target` to continue execution without issuing a raw `g` command. Use `windbg_get_output` with the returned `next_cursor` to fetch only newly buffered command output.
+Recommended agent flow in headless mode: call `windbg_open_session`, optionally `windbg_switch_session`, then follow the same command flow. If extension commands need kernel symbols, call `windbg_prepare_symbols` while broken into the target, and use `windbg_diagnose_extensions` when `.load kdexts` or `!process` is not behaving as expected. If the debugger is running or busy, call `windbg_interrupt_target` explicitly and verify state again before executing the command. Use `windbg_resume_target` to continue execution without issuing a raw `g` command. Use `windbg_get_output` with the returned `next_cursor` to fetch only newly buffered command output.
 
 ## Development
 
@@ -178,6 +181,16 @@ python tools/headless_mcp_smoke.py `
 
 The live smoke helper waits through transient `no_debuggee` states, interrupts a running target before executing commands, and closes the session through MCP cleanup even if a command fails.
 
+Additional tracked validation helpers:
+
+- `tools/headless_extension_smoke.py`: prepares symbols, loads `kdexts`, and runs extension-backed probes.
+- `tools/headless_get_output_check.py`: verifies cursor-based `windbg_get_output` reads.
+- `tools/headless_kdnet_soak.py`: repeats `interrupt -> execute -> resume` cycles and can probe guest TCP reachability.
+- `tools/shadowgate_smoke.py`: drives ShadowGate service/load-break inspections when guest SSH is available.
+
+For day-to-day operating guidance, see `docs/headless-operator-guide.md`. For output cursor regression coverage, see `docs/get-output-regression-plan.md`.
+ShadowGate-specific observations are tracked in `docs/shadowgate-notes.md`.
+
 ## Notes
 
 - This project was written entirely with a Vibe Coding workflow
@@ -188,3 +201,6 @@ The live smoke helper waits through transient `no_debuggee` states, interrupts a
 - The transport is Streamable HTTP
 - Headless mode also supports stdio transport
 - Set your MCP client timeout as high as possible, because some WinDbg operations can take a long time to finish
+- `no_debuggee` right after opening a live KDNET session is expected; wait for reconnect before executing commands
+- While the target is broken, the guest kernel is paused and SSH can appear down until `windbg_resume_target` or `windbg_recover_session`
+- Synthetic driver-load handling can still have cosmetic module-display quirks; for ShadowGate, `!drvobj ShadowGate 7` is currently more reliable than `lm m ShadowGate*` after a normal service start

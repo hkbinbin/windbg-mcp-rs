@@ -60,6 +60,17 @@ struct PrepareSymbolsArgs {
     force_mismatched: Option<bool>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct DiagnoseExtensionsArgs {
+    session_id: Option<String>,
+    extension: Option<String>,
+    probe_command: Option<String>,
+    prepare_symbols: Option<bool>,
+    module: Option<String>,
+    symbol_cache: Option<String>,
+    symbol_server: Option<String>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SearchCatalogArgs {
     query: String,
@@ -156,6 +167,24 @@ fn classify_symbol_status(lmv_output: &str) -> &'static str {
     } else {
         "unknown"
     }
+}
+
+fn output_indicates_symbol_problem(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("symbols are incorrect")
+        || lower.contains("symbol file could not be found")
+        || (lower.contains("mismatched") && lower.contains("symbol"))
+}
+
+fn chain_contains_extension(chain_output: &str, extension: &str) -> bool {
+    let chain = chain_output.to_ascii_lowercase();
+    let extension = extension
+        .trim_start_matches(".load")
+        .trim()
+        .trim_end_matches(".dll")
+        .to_ascii_lowercase();
+    !extension.is_empty()
+        && (chain.contains(&extension) || chain.contains(&format!("{extension}.dll")))
 }
 
 fn default_symbol_cache_dir() -> PathBuf {
@@ -261,6 +290,15 @@ impl WindbgMcpServer {
             schema_for_type::<PrepareSymbolsArgs>(),
         )
         .with_title("Prepare debugger symbols")
+    }
+
+    fn diagnose_extensions_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_diagnose_extensions",
+            "Collect extension-loading diagnostics. The tool returns `.extpath`, `.chain`, optional symbol preparation, extension load output, probe command output, and remediation hints.",
+            schema_for_type::<DiagnoseExtensionsArgs>(),
+        )
+        .with_title("Diagnose debugger extensions")
     }
 
     fn interrupt_tool(&self) -> Tool {
@@ -369,6 +407,7 @@ impl WindbgMcpServer {
             self.state_tool(),
             self.output_tool(),
             self.prepare_symbols_tool(),
+            self.diagnose_extensions_tool(),
             self.search_tool(),
             self.interrupt_tool(),
             self.resume_tool(),
@@ -530,6 +569,159 @@ impl WindbgMcpServer {
         }))
     }
 
+    async fn diagnostic_command_step(
+        &self,
+        session_id: Option<&str>,
+        command: &str,
+    ) -> (Value, String) {
+        match self
+            .execute_debugger_command(session_id, command.to_string())
+            .await
+        {
+            Ok(execution) => {
+                let output = execution.output.clone();
+                (render_execution_result(execution), output)
+            }
+            Err(error) => (
+                json!({
+                    "command": command,
+                    "error": format!("{error:?}"),
+                }),
+                String::new(),
+            ),
+        }
+    }
+
+    async fn diagnose_extensions(&self, args: DiagnoseExtensionsArgs) -> Result<Value, McpError> {
+        let extension = args
+            .extension
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("kdexts")
+            .to_string();
+        let probe_command = args
+            .probe_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("!process 0 0")
+            .to_string();
+        let module = args
+            .module
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("nt")
+            .to_string();
+
+        let mut steps = Vec::new();
+        let mut recommendations = Vec::new();
+
+        let (extpath_step, extpath_output) = self
+            .diagnostic_command_step(args.session_id.as_deref(), ".extpath")
+            .await;
+        steps.push(extpath_step);
+
+        let (chain_before_step, chain_before_output) = self
+            .diagnostic_command_step(args.session_id.as_deref(), ".chain")
+            .await;
+        steps.push(chain_before_step);
+
+        let mut symbol_status = "not_checked".to_string();
+        if args.prepare_symbols.unwrap_or(false) {
+            match self
+                .prepare_symbols(PrepareSymbolsArgs {
+                    session_id: args.session_id.clone(),
+                    module: Some(module.clone()),
+                    symbol_cache: args.symbol_cache.clone(),
+                    symbol_server: args.symbol_server.clone(),
+                    force_mismatched: None,
+                })
+                .await
+            {
+                Ok(payload) => {
+                    symbol_status = payload["symbol_status"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_string();
+                    steps.push(json!({
+                        "tool": "windbg_prepare_symbols",
+                        "result": payload,
+                    }));
+                }
+                Err(error) => {
+                    symbol_status = "prepare_failed".to_string();
+                    recommendations.push(
+                        "Symbol preparation failed; inspect `!lmi nt`, network access to the symbol server, and the configured symbol cache.".to_string(),
+                    );
+                    steps.push(json!({
+                        "tool": "windbg_prepare_symbols",
+                        "error": format!("{error:?}"),
+                    }));
+                }
+            }
+        }
+
+        let load_command = if extension.starts_with(".load") {
+            extension.clone()
+        } else {
+            format!(".load {extension}")
+        };
+        let (load_step, load_output) = self
+            .diagnostic_command_step(args.session_id.as_deref(), &load_command)
+            .await;
+        steps.push(load_step);
+
+        let (chain_after_step, chain_after_output) = self
+            .diagnostic_command_step(args.session_id.as_deref(), ".chain")
+            .await;
+        steps.push(chain_after_step);
+
+        let (probe_step, probe_output) = self
+            .diagnostic_command_step(args.session_id.as_deref(), &probe_command)
+            .await;
+        steps.push(probe_step);
+
+        let extension_loaded = chain_contains_extension(&chain_before_output, &extension)
+            || chain_contains_extension(&chain_after_output, &extension)
+            || chain_contains_extension(&load_output, &extension);
+        let symbol_problem = output_indicates_symbol_problem(&probe_output)
+            || output_indicates_symbol_problem(&load_output);
+
+        if extpath_output.trim().is_empty() {
+            recommendations.push(
+                "The effective extension path is empty or unavailable; check WinDbg Preview discovery/cache setup and `_NT_DEBUGGER_EXTENSION_PATH`.".to_string(),
+            );
+        }
+        if !extension_loaded {
+            recommendations.push(format!(
+                "`{extension}` was not visible in `.chain`; inspect `.extpath` and try loading the cached DLL path explicitly."
+            ));
+        }
+        if symbol_problem {
+            recommendations.push(format!(
+                "`{probe_command}` reported a symbol problem; run `windbg_prepare_symbols` for `{module}` and retry."
+            ));
+        }
+        if recommendations.is_empty() {
+            recommendations.push(
+                "Extension path, extension chain, and probe command did not expose an obvious failure.".to_string(),
+            );
+        }
+
+        Ok(json!({
+            "extension": extension,
+            "probe_command": probe_command,
+            "module": module,
+            "extension_loaded": extension_loaded,
+            "symbol_status": symbol_status,
+            "symbol_problem": symbol_problem,
+            "recommendations": recommendations,
+            "steps": steps,
+        }))
+    }
+
     async fn query_state(&self, session_id: Option<&str>) -> Result<Value, McpError> {
         let state = match &self.backend {
             ServerBackend::AttachedSession { dispatcher } => dispatcher
@@ -678,6 +870,7 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_get_execution_state" => Some(self.state_tool()),
             "windbg_get_output" => Some(self.output_tool()),
             "windbg_prepare_symbols" => Some(self.prepare_symbols_tool()),
+            "windbg_diagnose_extensions" => Some(self.diagnose_extensions_tool()),
             "windbg_search_catalog" => Some(self.search_tool()),
             "windbg_interrupt_target" => Some(self.interrupt_tool()),
             "windbg_resume_target" => Some(self.resume_tool()),
@@ -719,6 +912,11 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_prepare_symbols" => {
                 let args: PrepareSymbolsArgs = self.parse_arguments(request.arguments)?;
                 let payload = self.prepare_symbols(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_diagnose_extensions" => {
+                let args: DiagnoseExtensionsArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.diagnose_extensions(args).await?;
                 Ok(CallToolResult::structured(payload))
             }
             "windbg_search_catalog" => {
@@ -1022,6 +1220,16 @@ mod tests {
             .get_tool("windbg_prepare_symbols")
             .expect("prepare symbols tool should be listed for headless mode");
         assert_eq!(tool.name, "windbg_prepare_symbols");
+    }
+
+    #[test]
+    fn diagnose_extensions_tool_is_exposed_in_headless_mode() {
+        let server = WindbgMcpServer::headless(HeadlessSessionManager::new());
+
+        let tool = server
+            .get_tool("windbg_diagnose_extensions")
+            .expect("diagnose extensions tool should be listed for headless mode");
+        assert_eq!(tool.name, "windbg_diagnose_extensions");
     }
 
     #[test]

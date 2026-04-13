@@ -2326,7 +2326,14 @@ mod windows_impl {
 
     impl Drop for DbgEngExecutor {
         fn drop(&mut self) {
-            self.shutdown_host_if_needed();
+            if self.kernel_host.is_some() {
+                self.resume_if_ready_for_shutdown("drop before host stop");
+                thread::sleep(Duration::from_secs(2));
+                self.shutdown_host_if_needed();
+                self.resume_if_ready_for_shutdown("drop after host stop");
+            } else {
+                self.shutdown_host_if_needed();
+            }
         }
     }
 
