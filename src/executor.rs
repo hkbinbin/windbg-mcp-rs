@@ -719,12 +719,11 @@ mod windows_impl {
     use windows::{
         Win32::System::Diagnostics::Debug::Extensions::{
             DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_CONNECT_SESSION_NO_ANNOUNCE,
-            DEBUG_CONNECT_SESSION_NO_VERSION, DEBUG_END_ACTIVE_DETACH, DEBUG_ENGOPT_INITIAL_BREAK,
-            DEBUG_EXECUTE_DEFAULT, DEBUG_INTERRUPT_ACTIVE, DEBUG_INTERRUPT_EXIT,
-            DEBUG_INTERRUPT_PASSIVE, DEBUG_OUTCTL_THIS_CLIENT, DEBUG_STATUS_GO_HANDLED,
-            DebugCreate, IDebugClient, IDebugClient5, IDebugControl, IDebugDataSpaces,
-            IDebugOutputCallbacks, IDebugOutputCallbacks_Impl, IDebugRegisters, IDebugSymbols3,
-            IDebugSystemObjects3,
+            DEBUG_CONNECT_SESSION_NO_VERSION, DEBUG_ENGOPT_INITIAL_BREAK, DEBUG_EXECUTE_DEFAULT,
+            DEBUG_INTERRUPT_ACTIVE, DEBUG_INTERRUPT_EXIT, DEBUG_INTERRUPT_PASSIVE,
+            DEBUG_OUTCTL_THIS_CLIENT, DEBUG_STATUS_GO_HANDLED, DebugCreate, IDebugClient,
+            IDebugClient5, IDebugControl, IDebugDataSpaces, IDebugOutputCallbacks,
+            IDebugOutputCallbacks_Impl, IDebugRegisters, IDebugSymbols3, IDebugSystemObjects3,
         },
         core::{Error as WinError, HSTRING, Interface, PCSTR, Result as WinResult, implement},
     };
@@ -741,12 +740,6 @@ mod windows_impl {
     const HRESULT_E_PENDING: i32 = 0x8000000A_u32 as i32;
     const HRESULT_E_NOTIMPL: i32 = 0x80004001_u32 as i32;
     const HRESULT_COMMAND_WINDOW_NOT_SETTLED: i32 = 0x80040205_u32 as i32;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum SessionCleanup {
-        None,
-        EndSession(u32),
-    }
 
     enum HostCommand {
         AwaitCommandReady {
@@ -1435,7 +1428,6 @@ mod windows_impl {
     pub(crate) struct DbgEngExecutor {
         client: IDebugClient,
         control: IDebugControl,
-        cleanup: SessionCleanup,
         last_known_state: DebuggerExecutionState,
         pending_startup_command: Option<String>,
         kernel_host: Option<KernelSessionHost>,
@@ -1463,7 +1455,6 @@ mod windows_impl {
             Ok(Self {
                 client,
                 control,
-                cleanup: SessionCleanup::None,
                 last_known_state,
                 pending_startup_command: None,
                 kernel_host: None,
@@ -1482,7 +1473,9 @@ mod windows_impl {
             loop {
                 match Self::connect_session() {
                     Ok(mut executor) => {
-                        executor.cleanup = SessionCleanup::EndSession(DEBUG_END_ACTIVE_DETACH);
+                        // The host client owns the KDNET transport. Calling EndSession from this
+                        // connected command client can trip dbgeng's nested LoadModule guard during
+                        // driver-load events, so cleanup is handled by stopping the host client.
                         executor.pending_startup_command = startup_command
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
@@ -1514,7 +1507,6 @@ mod windows_impl {
             Ok(Self {
                 client,
                 control,
-                cleanup: SessionCleanup::None,
                 last_known_state,
                 pending_startup_command: None,
                 kernel_host: None,
@@ -1696,21 +1688,6 @@ mod windows_impl {
                 }
             }
         }
-
-        fn end_session_if_needed(&mut self) -> Result<(), ExecutionError> {
-            match self.cleanup {
-                SessionCleanup::None => Ok(()),
-                SessionCleanup::EndSession(flags) => {
-                    unsafe {
-                        self.client
-                            .EndSession(flags)
-                            .map_err(|error| ExecutionError::Command(error.to_string()))?;
-                    }
-                    self.cleanup = SessionCleanup::None;
-                    Ok(())
-                }
-            }
-        }
     }
 
     impl BlockingExecutor for DbgEngExecutor {
@@ -1853,21 +1830,16 @@ mod windows_impl {
         fn shutdown(&mut self) -> Result<(), ExecutionError> {
             if self.kernel_host.is_some() {
                 self.resume_if_ready_for_shutdown("before detach");
-                let detach_result = self.end_session_if_needed();
-                self.resume_if_ready_for_shutdown("after detach");
                 self.shutdown_host_if_needed();
                 self.resume_if_ready_for_shutdown("after host stop");
-                detach_result
-            } else {
-                self.end_session_if_needed()
             }
+            Ok(())
         }
     }
 
     impl Drop for DbgEngExecutor {
         fn drop(&mut self) {
             self.shutdown_host_if_needed();
-            let _ = self.end_session_if_needed();
         }
     }
 

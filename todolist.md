@@ -5,11 +5,11 @@
 - [x] Add bounded `windbg_close_session` teardown so live KDNET detach cannot hang the MCP server indefinitely.
   The tool now tries to resume a broken target before close, removes the session from the registry first, and reports `resume_error` / `shutdown_error` if dbgeng resume or teardown fails or times out.
 
-- [x] Keep the VM running after `windbg_close_session` even when dbgeng detach reports `0x800700D7`.
-  Verified with ShadowGate live KDNET regression: close still returned the dbgeng error, but guest SSH stayed reachable and the driver could be stopped afterward.
+- [x] Keep the VM running after `windbg_close_session`.
+  Verified with ShadowGate live KDNET regression: guest SSH stayed reachable and the driver could be stopped after MCP session close.
 
-- [ ] Eliminate the residual `0x800700D7` / `LoadModule` error from live KDNET detach.
-  The current close path is operationally safe for the VM, but `shutdown_completed` can still be false because dbgeng rejects teardown during a nested load-module state.
+- [x] Eliminate the residual `0x800700D7` / `LoadModule` error from live KDNET detach.
+  Fixed by letting the kernel host client own transport teardown instead of calling `EndSession` from the connected command client. Verified with plain KDNET close and ShadowGate load-break close: `shutdown_completed=true`, `shutdown_error=null`, and guest SSH stayed reachable.
 
 - [ ] Make session lifecycle resilient after tool/client interruption.
   If the client script exits mid-debug, the target should still be resumable and the session should be recoverable or self-cleaning.
