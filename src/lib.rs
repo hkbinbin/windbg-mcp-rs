@@ -20,4 +20,5 @@ pub use plugin_server::{PluginServerControl, PluginServerStatus};
 pub use server::WindbgMcpServer;
 pub use session_manager::{
     CloseSessionResult, HeadlessSessionInfo, HeadlessSessionList, HeadlessSessionManager,
+    RecoverSessionResult,
 };

@@ -32,6 +32,13 @@ struct ResumeTargetArgs {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+struct RecoverSessionArgs {
+    session_id: Option<String>,
+    resume_if_broken: Option<bool>,
+    interrupt_if_running: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 struct GetExecutionStateArgs {
     session_id: Option<String>,
 }
@@ -160,6 +167,15 @@ impl WindbgMcpServer {
         .with_title("Resume target")
     }
 
+    fn recover_session_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_recover_session",
+            "Recover a headless session into a safer operational state. By default it resumes a broken target so the VM is not left paused; set `interrupt_if_running` to true to break into a running target instead.",
+            schema_for_type::<RecoverSessionArgs>(),
+        )
+        .with_title("Recover headless session")
+    }
+
     fn search_tool(&self) -> Tool {
         Tool::new(
             "windbg_search_catalog",
@@ -255,6 +271,7 @@ impl WindbgMcpServer {
             self.switch_session_tool(),
             self.list_sessions_tool(),
             self.current_session_tool(),
+            self.recover_session_tool(),
         ]
     }
 
@@ -404,7 +421,7 @@ impl WindbgMcpServer {
 impl ServerHandler for WindbgMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.is_headless() {
-            "Open a session with `windbg_open_session` before using debugger actions. Then call `windbg_search_catalog`, read `windbg://command/{id}`, call `windbg_get_execution_state`, interrupt if needed, and only then call `windbg_execute_command`. Use `windbg_get_output` with the returned cursor to fetch buffered command output incrementally. Use `windbg_resume_target` to continue a live target without blocking on a raw `g` command. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
+            "Open a session with `windbg_open_session` before using debugger actions. Then call `windbg_search_catalog`, read `windbg://command/{id}`, call `windbg_get_execution_state`, interrupt if needed, and only then call `windbg_execute_command`. Use `windbg_get_output` with the returned cursor to fetch buffered command output incrementally. Use `windbg_resume_target` to continue a live target without blocking on a raw `g` command. Use `windbg_recover_session` if a live KDNET target may have been left broken or you need a bounded break-in recovery action. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
         } else {
             "This server is organized around low-context resources plus a small toolset. Start with `windbg_search_catalog`, read `windbg://command/{id}`, optionally escalate to `windbg://command-full/{id}`, then call `windbg_get_execution_state`. If the debugger is running or busy, call `windbg_interrupt_target` and verify state again before calling `windbg_execute_command`. Use `windbg_get_output` to read buffered command output again later, and `windbg_resume_target` to continue execution without issuing a raw `g` command."
         };
@@ -446,6 +463,7 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_switch_session" if self.is_headless() => Some(self.switch_session_tool()),
             "windbg_list_sessions" if self.is_headless() => Some(self.list_sessions_tool()),
             "windbg_current_session" if self.is_headless() => Some(self.current_session_tool()),
+            "windbg_recover_session" if self.is_headless() => Some(self.recover_session_tool()),
             _ => None,
         }
     }
@@ -550,6 +568,21 @@ impl ServerHandler for WindbgMcpServer {
                         &args.session_id,
                         args.shutdown_timeout_secs,
                         args.resume_before_close,
+                    )
+                    .await
+                    .map_err(Self::map_execution_error)?;
+                Ok(CallToolResult::structured(json!(result)))
+            }
+            "windbg_recover_session" => {
+                let ServerBackend::Headless { sessions } = &self.backend else {
+                    return Err(McpError::method_not_found::<CallToolRequestMethod>());
+                };
+                let args: RecoverSessionArgs = self.parse_arguments(request.arguments)?;
+                let result = sessions
+                    .recover_session(
+                        args.session_id.as_deref(),
+                        args.resume_if_broken,
+                        args.interrupt_if_running,
                     )
                     .await
                     .map_err(Self::map_execution_error)?;
@@ -741,6 +774,16 @@ mod tests {
             .get_tool("windbg_resume_target")
             .expect("resume tool should be listed");
         assert_eq!(tool.name, "windbg_resume_target");
+    }
+
+    #[test]
+    fn recover_tool_is_exposed_in_headless_mode() {
+        let server = WindbgMcpServer::headless(HeadlessSessionManager::new());
+
+        let tool = server
+            .get_tool("windbg_recover_session")
+            .expect("recover tool should be listed for headless mode");
+        assert_eq!(tool.name, "windbg_recover_session");
     }
 
     #[test]

@@ -44,6 +44,16 @@ pub struct CloseSessionResult {
     pub shutdown_timeout_secs: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoverSessionResult {
+    pub session_id: String,
+    pub action: String,
+    pub recovered: bool,
+    pub state_before: DebuggerExecutionState,
+    pub state_after: DebuggerExecutionState,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub struct HeadlessSessionManager {
     inner: Arc<Mutex<SessionRegistry>>,
@@ -349,6 +359,59 @@ impl HeadlessSessionManager {
         Ok(result)
     }
 
+    pub async fn recover_session(
+        &self,
+        session_id: Option<&str>,
+        resume_if_broken: Option<bool>,
+        interrupt_if_running: Option<bool>,
+    ) -> Result<RecoverSessionResult, ExecutionError> {
+        let resume_if_broken = resume_if_broken.unwrap_or(true);
+        let interrupt_if_running = interrupt_if_running.unwrap_or(false);
+        let (session_id, dispatcher) = self.resolve_dispatcher(session_id)?;
+        let state_before = dispatcher.query_state().await?;
+
+        let (action, recovered, state_after, error) =
+            if state_before.ready_for_commands && resume_if_broken {
+                match dispatcher.resume().await {
+                    Ok(state_after) => ("resume_target".to_string(), true, state_after, None),
+                    Err(error) => (
+                        "resume_target".to_string(),
+                        false,
+                        dispatcher
+                            .query_state()
+                            .await
+                            .unwrap_or_else(|_| state_before.clone()),
+                        Some(error.to_string()),
+                    ),
+                }
+            } else if state_before.running && interrupt_if_running {
+                match dispatcher.interrupt().await {
+                    Ok(state_after) => ("interrupt_target".to_string(), true, state_after, None),
+                    Err(error) => (
+                        "interrupt_target".to_string(),
+                        false,
+                        dispatcher
+                            .query_state()
+                            .await
+                            .unwrap_or_else(|_| state_before.clone()),
+                        Some(error.to_string()),
+                    ),
+                }
+            } else {
+                ("none".to_string(), false, state_before.clone(), None)
+            };
+
+        self.touch_session(&session_id);
+        Ok(RecoverSessionResult {
+            session_id,
+            action,
+            recovered,
+            state_before,
+            state_after,
+            error,
+        })
+    }
+
     pub async fn get_output(
         &self,
         session_id: Option<&str>,
@@ -602,6 +665,27 @@ mod tests {
             .await
             .expect_err("closed session should no longer be routable");
         assert!(matches!(error, ExecutionError::Session(_)));
+    }
+
+    #[tokio::test]
+    async fn recover_session_resumes_broken_mock_session() {
+        let manager = HeadlessSessionManager::new();
+        manager
+            .open_mock_session("session-01", HashMap::new())
+            .await
+            .expect("mock session should open");
+
+        let result = manager
+            .recover_session(None, None, None)
+            .await
+            .expect("recover should resume the broken mock session");
+
+        assert_eq!(result.session_id, "session-01");
+        assert_eq!(result.action, "resume_target");
+        assert!(result.recovered);
+        assert_eq!(result.error, None);
+        assert!(result.state_before.ready_for_commands);
+        assert!(result.state_after.running);
     }
 
     #[tokio::test]

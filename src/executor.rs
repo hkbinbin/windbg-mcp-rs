@@ -1222,6 +1222,11 @@ mod windows_impl {
                     thread::sleep(COMMAND_READY_RETRY_DELAY);
                 }
                 Err(CommandAttemptError::Retryable(reason)) => {
+                    if let Some(fallback) =
+                        try_render_thread_command_fallback(client, command, &reason)
+                    {
+                        return fallback;
+                    }
                     return Err(ExecutionError::Command(format!(
                         "kernel host command did not settle after {} attempts while running `{}`: {}",
                         COMMAND_READY_RETRY_ATTEMPTS, command, reason
@@ -1332,6 +1337,91 @@ mod windows_impl {
                 "kernel host failed to synchronize scope to the current event"
             );
         }
+    }
+
+    fn try_render_thread_command_fallback(
+        client: &IDebugClient,
+        command: &str,
+        retryable_reason: &str,
+    ) -> Option<Result<String, ExecutionError>> {
+        if !is_thread_list_command(command) || !retryable_reason.contains("0x80040205") {
+            return None;
+        }
+
+        tracing::debug!(
+            command = %command,
+            reason = %retryable_reason,
+            "text thread-list command failed in the command window; using dbgeng system-object fallback"
+        );
+        Some(render_thread_list_from_system_objects(client))
+    }
+
+    pub(super) fn is_thread_list_command(command: &str) -> bool {
+        matches!(command.trim(), "~" | "~*")
+    }
+
+    fn render_thread_list_from_system_objects(
+        client: &IDebugClient,
+    ) -> Result<String, ExecutionError> {
+        sync_host_command_scope(client);
+
+        let system_objects = client
+            .cast::<IDebugSystemObjects3>()
+            .map_err(|error| ExecutionError::Command(error.to_string()))?;
+        let thread_count = unsafe { system_objects.GetNumberThreads() }
+            .map_err(|error| ExecutionError::Command(error.to_string()))?;
+        let current_thread_id = unsafe { system_objects.GetCurrentThreadId() }.ok();
+        let event_thread_id = unsafe { system_objects.GetEventThread() }.ok();
+        let current_system_id = unsafe { system_objects.GetCurrentThreadSystemId() }.ok();
+
+        let mut ids = vec![0u32; thread_count as usize];
+        let mut system_ids = vec![0u32; thread_count as usize];
+        if thread_count > 0 {
+            unsafe {
+                system_objects
+                    .GetThreadIdsByIndex(
+                        0,
+                        thread_count,
+                        Some(ids.as_mut_ptr()),
+                        Some(system_ids.as_mut_ptr()),
+                    )
+                    .map_err(|error| ExecutionError::Command(error.to_string()))?;
+            }
+        }
+
+        let mut output = String::new();
+        output.push_str(
+            "Thread list supplied by dbgeng API fallback because the text `~` command window was not settled.\n",
+        );
+        output.push_str("Legend: `.` = current thread, `#` = event thread.\n");
+        if let Some(system_id) = current_system_id {
+            output.push_str(&format!(
+                "Current thread system id: {system_id} (0x{system_id:x})\n"
+            ));
+        }
+        output.push_str("   Id        SystemId\n");
+
+        for (id, system_id) in ids.into_iter().zip(system_ids) {
+            let current_marker = if Some(id) == current_thread_id {
+                '.'
+            } else {
+                ' '
+            };
+            let event_marker = if Some(id) == event_thread_id {
+                '#'
+            } else {
+                ' '
+            };
+            output.push_str(&format!(
+                "{current_marker}{event_marker} {id:>4} {system_id:>12} (0x{system_id:x})\n"
+            ));
+        }
+
+        if thread_count == 0 {
+            output.push_str("No threads are currently reported by dbgeng.\n");
+        }
+
+        Ok(output)
     }
 
     pub(super) fn is_transient_command_hresult(code: i32) -> bool {
@@ -1822,5 +1912,18 @@ mod tests {
         assert!(
             !crate::executor::windows_impl::is_transient_command_hresult(0x80004001_u32 as i32)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identifies_thread_list_fallback_commands() {
+        assert!(crate::executor::windows_impl::is_thread_list_command("~"));
+        assert!(crate::executor::windows_impl::is_thread_list_command(
+            "  ~*  "
+        ));
+        assert!(!crate::executor::windows_impl::is_thread_list_command(
+            "~0 k"
+        ));
+        assert!(!crate::executor::windows_impl::is_thread_list_command("k"));
     }
 }

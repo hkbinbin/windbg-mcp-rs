@@ -106,6 +106,7 @@ Headless mode adds session-management tools:
 - `windbg_switch_session`
 - `windbg_list_sessions`
 - `windbg_current_session`
+- `windbg_recover_session`
 
 Live-target control is split into explicit tools:
 
@@ -116,6 +117,10 @@ Live-target control is split into explicit tools:
 - `windbg_execute_command`
 
 `windbg_close_session` tries to resume a broken target before teardown by default; pass `resume_before_close: false` to skip that behavior. It also accepts an optional `shutdown_timeout_secs` value. The session is removed from the MCP registry first, and the bounded shutdown result reports whether dbgeng teardown completed cleanly or timed out in the background. This keeps live KDNET detach issues from hanging the MCP server.
+
+`windbg_recover_session` is the safe recovery shortcut for long-running KDNET work: by default it checks the session state and resumes a broken target, returning structured before/after state and any recovery error. Set `interrupt_if_running: true` when you intentionally want the recovery action to break into a running target instead.
+
+If a text thread-list command such as `~` hits dbgeng's transient `0x80040205` command-window state after a synthetic load or breakpoint event, headless mode falls back to `IDebugSystemObjects` and returns a compact thread-id list instead of failing outright.
 
 ## What MCP Exposes
 
@@ -133,6 +138,21 @@ Recommended agent flow in headless mode: call `windbg_open_session`, optionally 
 ```powershell
 cargo check
 cargo test
+```
+
+Run the stdio smoke helper after building the release binary:
+
+```powershell
+python tools/headless_mcp_smoke.py
+```
+
+To validate a live KDNET session, pass your own connection string:
+
+```powershell
+python tools/headless_mcp_smoke.py `
+  --connection "net:port=50000,key=<your-kdnet-key>" `
+  --session-id kdnet-smoke `
+  --command vertarget
 ```
 
 ## Notes

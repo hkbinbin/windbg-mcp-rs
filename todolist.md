@@ -11,7 +11,10 @@
 - [ ] Make session lifecycle resilient after tool/client interruption.
   If the client script exits mid-debug, the target should still be resumable and the session should be recoverable or self-cleaning.
 
-- [ ] Add a tested recovery path for "VM paused in debugger" situations.
+- [x] Add an MCP recovery path for "VM paused in debugger" situations.
+  `windbg_recover_session` now checks state and resumes a broken target by default, or can intentionally interrupt a running target when requested.
+
+- [ ] Add an end-to-end recovery validation that confirms guest SSH is back after `windbg_recover_session`.
   Goal: one documented command or tool flow to reopen, force `go`, and confirm guest SSH is back.
 
 ## P0 Dynamic Debugging Usability
@@ -24,6 +27,9 @@
 
 - [ ] Verify command execution remains stable immediately after breakpoint hits.
   We need repeatable `break -> inspect regs/stack -> execute commands -> resume` without transient command-engine failures.
+
+- [x] Add a thread-list fallback for `~` when dbgeng reports transient `0x80040205`.
+  The fallback uses `IDebugSystemObjects` to return current/event thread ids instead of failing outright.
 
 ## P1 WinDbg Extension Support
 
@@ -55,7 +61,10 @@
 
 ## P2 Maintainability
 
-- [ ] Move ad-hoc external validation helpers into a tracked `tools/` or `scripts/` directory.
+- [x] Move the basic stdio/live validation helper into a tracked `tools/` directory.
+  `tools/headless_mcp_smoke.py` can validate initialize/tools-list and optionally open/close a live KDNET session without storing secrets in the repo.
+
+- [ ] Promote deeper ShadowGate and breakpoint-hit validation helpers into tracked scripts.
   Current temporary artifacts live outside the repo root and should either be promoted into the project or discarded after capture.
 
 - [ ] Document real-world known limitations in `README.md`.
