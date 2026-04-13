@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde::Serialize;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use crate::executor::{
     CommandDispatcher, CommandExecutionResult, DebuggerExecutionState, ExecutionError,
@@ -61,6 +61,7 @@ pub struct HeadlessSessionManager {
 
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CLOSE_RESUME_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_KERNEL_CLOSE_POST_RESUME_DELAY: Duration = Duration::from_secs(2);
 const DEFAULT_RESUME_BEFORE_CLOSE: bool = true;
 
 struct SessionRegistry {
@@ -199,7 +200,7 @@ impl HeadlessSessionManager {
         shutdown_timeout_secs: Option<u64>,
         resume_before_close: Option<bool>,
     ) -> Result<CloseSessionResult, ExecutionError> {
-        let (dispatcher, session_id, default_session_id, remaining_sessions) = {
+        let (dispatcher, session_id, transport, default_session_id, remaining_sessions) = {
             let mut registry = self
                 .inner
                 .lock()
@@ -216,6 +217,7 @@ impl HeadlessSessionManager {
             (
                 removed.dispatcher,
                 removed.session_id,
+                removed.transport,
                 default_session_id,
                 remaining_sessions,
             )
@@ -223,7 +225,7 @@ impl HeadlessSessionManager {
 
         let resume_before_close = resume_before_close.unwrap_or(DEFAULT_RESUME_BEFORE_CLOSE);
         let (resume_attempted, resume_error) = if resume_before_close {
-            resume_session_before_close(&dispatcher).await
+            resume_session_before_close(&dispatcher, &transport).await
         } else {
             (false, None)
         };
@@ -546,7 +548,10 @@ fn timestamp_now_ms() -> u64 {
         .as_millis() as u64
 }
 
-async fn resume_session_before_close(dispatcher: &CommandDispatcher) -> (bool, Option<String>) {
+async fn resume_session_before_close(
+    dispatcher: &CommandDispatcher,
+    transport: &str,
+) -> (bool, Option<String>) {
     let state = match timeout(DEFAULT_CLOSE_RESUME_TIMEOUT, dispatcher.query_state()).await {
         Ok(Ok(state)) => state,
         Ok(Err(error)) => return (false, Some(error.to_string())),
@@ -576,7 +581,12 @@ async fn resume_session_before_close(dispatcher: &CommandDispatcher) -> (bool, O
     }
 
     match timeout(DEFAULT_CLOSE_RESUME_TIMEOUT, dispatcher.resume()).await {
-        Ok(Ok(_)) => (true, None),
+        Ok(Ok(state_after)) => {
+            if transport == "kernel" && state_after.running {
+                sleep(DEFAULT_KERNEL_CLOSE_POST_RESUME_DELAY).await;
+            }
+            (true, None)
+        }
         Ok(Err(error)) => (true, Some(error.to_string())),
         Err(_) => (
             true,

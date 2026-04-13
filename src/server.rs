@@ -1,3 +1,5 @@
+use std::{fs, path::PathBuf, process::Command};
+
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, handler::server::common::schema_for_type,
     model::*, schemars::JsonSchema, service::RequestContext,
@@ -7,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{
     catalog::{Catalog, CatalogEntry, CatalogResourceKind, CatalogSection},
-    executor::{CommandDispatcher, ExecutionError},
+    executor::{CommandDispatcher, CommandExecutionResult, ExecutionError},
     resources::{GUIDE_URI, render_compact_command, render_full_command, render_guide},
     session_manager::HeadlessSessionManager,
 };
@@ -47,6 +49,15 @@ struct GetExecutionStateArgs {
 struct GetOutputArgs {
     session_id: Option<String>,
     cursor: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct PrepareSymbolsArgs {
+    session_id: Option<String>,
+    module: Option<String>,
+    symbol_cache: Option<String>,
+    symbol_server: Option<String>,
+    force_mismatched: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -91,6 +102,100 @@ enum ServerBackend {
 #[derive(Clone)]
 pub struct WindbgMcpServer {
     backend: ServerBackend,
+}
+
+struct PdbInfo {
+    name: String,
+    guid: String,
+    age: u32,
+}
+
+impl PdbInfo {
+    fn symbol_server_index(&self) -> String {
+        format!(
+            "{}{:X}",
+            self.guid.replace('-', "").to_ascii_uppercase(),
+            self.age
+        )
+    }
+}
+
+fn render_execution_result(execution: CommandExecutionResult) -> Value {
+    json!({
+        "command": execution.command,
+        "output": execution.output,
+        "state_before": execution.state_before,
+        "state_after": execution.state_after,
+    })
+}
+
+fn parse_lmi_pdb_info(output: &str) -> Option<PdbInfo> {
+    let guid = output
+        .lines()
+        .find_map(|line| line.split_once("GUID:").map(|(_, value)| value.trim()))?
+        .trim_matches('{')
+        .trim_matches('}')
+        .to_string();
+
+    let age_line = output.lines().find(|line| line.contains("Age:"))?;
+    let age_text = age_line.split_once("Age:")?.1.split(',').next()?.trim();
+    let age = age_text.parse::<u32>().ok()?;
+    let name = age_line.split_once("Pdb:")?.1.trim().to_string();
+    if guid.is_empty() || name.is_empty() {
+        return None;
+    }
+
+    Some(PdbInfo { name, guid, age })
+}
+
+fn classify_symbol_status(lmv_output: &str) -> &'static str {
+    if lmv_output.contains("(pdb symbols)") {
+        "pdb"
+    } else if lmv_output.contains("(export symbols)") {
+        "export"
+    } else {
+        "unknown"
+    }
+}
+
+fn default_symbol_cache_dir() -> PathBuf {
+    std::env::var_os("WINDBG_MCP_SYMBOL_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Symbols"))
+}
+
+fn download_symbol_file(url: &str, destination: &PathBuf) -> Result<(), String> {
+    let parent = destination.parent().ok_or_else(|| {
+        format!(
+            "symbol destination has no parent: {}",
+            destination.display()
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("failed to create `{}`: {error}", parent.display()))?;
+
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "& { param($Uri, $OutFile) $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile }",
+        ])
+        .arg(url)
+        .arg(destination)
+        .output()
+        .map_err(|error| format!("failed to start powershell symbol download: {error}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to download `{url}` to `{}`: {}{}",
+            destination.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
 }
 
 impl WindbgMcpServer {
@@ -147,6 +252,15 @@ impl WindbgMcpServer {
             schema_for_type::<GetOutputArgs>(),
         )
         .with_title("Get debugger output")
+    }
+
+    fn prepare_symbols_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_prepare_symbols",
+            "Prepare exact PDB symbols for a loaded module, defaulting to `nt`. The tool reads `!lmi`, downloads the module PDB from the Microsoft symbol server into a local cache, appends the exact PDB directory to `.sympath`, and reloads the module.",
+            schema_for_type::<PrepareSymbolsArgs>(),
+        )
+        .with_title("Prepare debugger symbols")
     }
 
     fn interrupt_tool(&self) -> Tool {
@@ -254,6 +368,7 @@ impl WindbgMcpServer {
             self.generic_command_tool(),
             self.state_tool(),
             self.output_tool(),
+            self.prepare_symbols_tool(),
             self.search_tool(),
             self.interrupt_tool(),
             self.resume_tool(),
@@ -289,6 +404,18 @@ impl WindbgMcpServer {
         session_id: Option<&str>,
         command: String,
     ) -> Result<Value, McpError> {
+        let execution = self
+            .execute_debugger_command(session_id, command.clone())
+            .await?;
+
+        Ok(render_execution_result(execution))
+    }
+
+    async fn execute_debugger_command(
+        &self,
+        session_id: Option<&str>,
+        command: String,
+    ) -> Result<CommandExecutionResult, McpError> {
         let execution = match &self.backend {
             ServerBackend::AttachedSession { dispatcher } => dispatcher
                 .execute(command.clone())
@@ -300,11 +427,106 @@ impl WindbgMcpServer {
                 .map_err(Self::map_execution_error)?,
         };
 
+        Ok(execution)
+    }
+
+    async fn prepare_symbols(&self, args: PrepareSymbolsArgs) -> Result<Value, McpError> {
+        let module = args
+            .module
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("nt")
+            .to_string();
+        let symbol_cache = args
+            .symbol_cache
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(default_symbol_cache_dir);
+        let symbol_server = args
+            .symbol_server
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("https://msdl.microsoft.com/download/symbols")
+            .trim_end_matches('/')
+            .to_string();
+
+        let mut steps = Vec::new();
+        let lmi_command = format!("!lmi {module}");
+        let lmi = self
+            .execute_debugger_command(args.session_id.as_deref(), lmi_command)
+            .await?;
+        let pdb = parse_lmi_pdb_info(&lmi.output).ok_or_else(|| {
+            McpError::internal_error(
+                format!("could not find CodeView PDB information in `!lmi {module}` output"),
+                None,
+            )
+        })?;
+        steps.push(render_execution_result(lmi));
+
+        let pdb_index = pdb.symbol_server_index();
+        let pdb_dir = symbol_cache.join(&pdb.name).join(&pdb_index);
+        let pdb_path = pdb_dir.join(&pdb.name);
+        let symbol_url = format!("{symbol_server}/{}/{}/{}", pdb.name, pdb_index, pdb.name);
+        let downloaded = if pdb_path.is_file() {
+            false
+        } else {
+            let destination = pdb_path.clone();
+            let url = symbol_url.clone();
+            tokio::task::spawn_blocking(move || download_symbol_file(&url, &destination))
+                .await
+                .map_err(|error| {
+                    McpError::internal_error(format!("symbol download task failed: {error}"), None)
+                })?
+                .map_err(|error| McpError::internal_error(error, None))?;
+            true
+        };
+
+        let sympath = self
+            .execute_debugger_command(
+                args.session_id.as_deref(),
+                format!(".sympath+ {}", pdb_dir.display()),
+            )
+            .await?;
+        steps.push(render_execution_result(sympath));
+
+        let reload_switch = if args.force_mismatched.unwrap_or(false) {
+            "/i /f"
+        } else {
+            "/f"
+        };
+        let reload = self
+            .execute_debugger_command(
+                args.session_id.as_deref(),
+                format!(".reload {reload_switch} {module}"),
+            )
+            .await?;
+        steps.push(render_execution_result(reload));
+
+        let lmv = self
+            .execute_debugger_command(args.session_id.as_deref(), format!("lmv m {module}"))
+            .await?;
+        let symbol_status = classify_symbol_status(&lmv.output);
+        steps.push(render_execution_result(lmv));
+
         Ok(json!({
-            "command": execution.command,
-            "output": execution.output,
-            "state_before": execution.state_before,
-            "state_after": execution.state_after,
+            "module": module,
+            "pdb": {
+                "name": pdb.name,
+                "guid": pdb.guid,
+                "age": pdb.age,
+                "symbol_server_index": pdb_index,
+                "url": symbol_url,
+                "local_path": pdb_path,
+                "downloaded": downloaded,
+            },
+            "symbol_cache": symbol_cache,
+            "symbol_status": symbol_status,
+            "success": symbol_status == "pdb",
+            "steps": steps,
         }))
     }
 
@@ -455,6 +677,7 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_execute_command" => Some(self.generic_command_tool()),
             "windbg_get_execution_state" => Some(self.state_tool()),
             "windbg_get_output" => Some(self.output_tool()),
+            "windbg_prepare_symbols" => Some(self.prepare_symbols_tool()),
             "windbg_search_catalog" => Some(self.search_tool()),
             "windbg_interrupt_target" => Some(self.interrupt_tool()),
             "windbg_resume_target" => Some(self.resume_tool()),
@@ -491,6 +714,11 @@ impl ServerHandler for WindbgMcpServer {
                 let payload = self
                     .get_output(args.session_id.as_deref(), args.cursor)
                     .await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_prepare_symbols" => {
+                let args: PrepareSymbolsArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.prepare_symbols(args).await?;
                 Ok(CallToolResult::structured(payload))
             }
             "windbg_search_catalog" => {
@@ -784,6 +1012,37 @@ mod tests {
             .get_tool("windbg_recover_session")
             .expect("recover tool should be listed for headless mode");
         assert_eq!(tool.name, "windbg_recover_session");
+    }
+
+    #[test]
+    fn prepare_symbols_tool_is_exposed_in_headless_mode() {
+        let server = WindbgMcpServer::headless(HeadlessSessionManager::new());
+
+        let tool = server
+            .get_tool("windbg_prepare_symbols")
+            .expect("prepare symbols tool should be listed for headless mode");
+        assert_eq!(tool.name, "windbg_prepare_symbols");
+    }
+
+    #[test]
+    fn lmi_pdb_info_extracts_symbol_server_index() {
+        let output = r#"
+Loaded Module Info: [nt]
+    Image path: nt
+    Symbol status:  Symbols deferred
+    CodeView: RSDS - GUID: {B9E105C7-03F2-8FE8-B3BF-1877133D5CC2}
+        Age: 1, Pdb: ntkrnlmp.pdb
+"#;
+
+        let pdb = parse_lmi_pdb_info(output).expect("PDB info should be parsed");
+
+        assert_eq!(pdb.name, "ntkrnlmp.pdb");
+        assert_eq!(pdb.guid, "B9E105C7-03F2-8FE8-B3BF-1877133D5CC2");
+        assert_eq!(pdb.age, 1);
+        assert_eq!(
+            pdb.symbol_server_index(),
+            "B9E105C703F28FE8B3BF1877133D5CC21"
+        );
     }
 
     #[test]

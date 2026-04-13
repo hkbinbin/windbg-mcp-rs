@@ -6,7 +6,7 @@
   The tool now tries to resume a broken target before close, removes the session from the registry first, and reports `resume_error` / `shutdown_error` if dbgeng resume or teardown fails or times out.
 
 - [x] Keep the VM running after `windbg_close_session`.
-  Verified with ShadowGate live KDNET regression: guest SSH stayed reachable and the driver could be stopped after MCP session close.
+  Verified with ShadowGate live KDNET regression: guest SSH stayed reachable and the driver could be stopped after MCP session close. A later live regression showed close could report resume success but detach too quickly; kernel close now waits briefly after auto-resume, and a follow-up smoke kept SSH reachable after close.
 
 - [x] Eliminate the residual `0x800700D7` / `LoadModule` error from live KDNET detach.
   Fixed by letting the kernel host client own transport teardown instead of calling `EndSession` from the connected command client. Verified with plain KDNET close and ShadowGate load-break close: `shutdown_completed=true`, `shutdown_error=null`, and guest SSH stayed reachable.
@@ -50,12 +50,13 @@
 
 - [ ] Add regression coverage for extension-backed commands.
   Minimum smoke target: `.load kdexts`, `!process 0 0`, `!drvobj ShadowGate 7`.
+  Live smoke now passes after `windbg_prepare_symbols`; a tracked automated regression script is still pending.
 
 - [ ] Make extension command failures self-diagnosing.
   If `.load kdexts` or `!process` fails, return the effective extension search path and discovered WinDbg extension directories in the tool output.
 
-- [ ] Add a symbol bootstrap workflow for extension-backed commands.
-  Live validation now loads `kdexts` from the local WinDbg runtime cache, but `!process 0 0` reports incorrect NT symbols unless the operator configures symbols first, for example through `startup_command`.
+- [x] Add a symbol bootstrap workflow for extension-backed commands.
+  `windbg_prepare_symbols` now reads `!lmi`, downloads the exact CodeView PDB into the local cache, appends the exact PDB directory to `.sympath`, and reloads the module. Live KDNET validation prepared `nt` symbols, loaded `kdexts`, and then ran `!process 0 0` plus `!drvobj ShadowGate 7` successfully.
 
 ## P1 ShadowGate Validation
 
@@ -67,6 +68,7 @@
 
 - [ ] Fix or document synthetic module display quirks after driver-load breaks.
   The entrypoint breakpoint currently works, but stack output can show `<Unloaded_ShadowGateSys.sys>+0x8000`; this should either be corrected with better synthetic module registration or documented as cosmetic.
+  Also observed: after a normal service start, `!drvobj ShadowGate 7` resolves the driver object and dispatch table, but `lm m ShadowGate*` can still be empty.
 
 - [ ] Capture and document the ShadowGate protocol observed so far.
   Known facts:
@@ -86,7 +88,7 @@
 ## P2 Maintainability
 
 - [x] Move the basic stdio/live validation helper into a tracked `tools/` directory.
-  `tools/headless_mcp_smoke.py` can validate initialize/tools-list and optionally open/close a live KDNET session without storing secrets in the repo.
+  `tools/headless_mcp_smoke.py` can validate initialize/tools-list and optionally open/close a live KDNET session without storing secrets in the repo. It now waits through transient `no_debuggee` states, breaks running targets before command execution, and cleans up via MCP close on errors.
 
 - [ ] Promote deeper ShadowGate and breakpoint-hit validation helpers into tracked scripts.
   Current temporary artifacts live outside the repo root and should either be promoted into the project or discarded after capture.

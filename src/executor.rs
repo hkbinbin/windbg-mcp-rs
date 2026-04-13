@@ -797,10 +797,25 @@ mod windows_impl {
         tracing::debug!(
             "no preferred WinDbg dbgeng.dll was discovered; falling back to the system loader"
         );
-        let module =
-            unsafe { LoadLibraryExW(&HSTRING::from("dbgeng.dll"), None, Default::default()) }
-                .map_err(|error| error.to_string())?;
+        let path = system_dbgeng_path().unwrap_or_else(|| PathBuf::from("dbgeng.dll"));
+        let module = unsafe {
+            LoadLibraryExW(
+                &HSTRING::from(path.display().to_string()),
+                None,
+                LOAD_WITH_ALTERED_SEARCH_PATH,
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        configure_default_debugger_runtime_search_path();
         Ok(module.0 as usize)
+    }
+
+    fn system_dbgeng_path() -> Option<PathBuf> {
+        let system_root = env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let path = system_root.join("System32\\dbgeng.dll");
+        path.is_file().then_some(path)
     }
 
     fn preferred_dbgeng_path() -> Option<PathBuf> {
@@ -845,6 +860,24 @@ mod windows_impl {
                 ?error,
                 "failed to add the debugger directory to the DLL search path"
             );
+        }
+    }
+
+    fn configure_default_debugger_runtime_search_path() {
+        for root in candidate_debugger_runtime_roots() {
+            let debugger_dir = root.join("amd64");
+            if !debugger_dir.is_dir() {
+                continue;
+            }
+
+            let debugger_dir = HSTRING::from(debugger_dir.display().to_string());
+            if let Err(error) = unsafe { SetDllDirectoryW(&debugger_dir) } {
+                tracing::debug!(
+                    ?error,
+                    "failed to add the default debugger runtime to the DLL search path"
+                );
+            }
+            return;
         }
     }
 

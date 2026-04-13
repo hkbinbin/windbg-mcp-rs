@@ -128,6 +128,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attach-timeout-secs", type=int, default=30)
     parser.add_argument("--shutdown-timeout-secs", type=int, default=5)
     parser.add_argument(
+        "--ready-timeout-secs",
+        type=int,
+        default=60,
+        help="How long to wait for a live session to become attached/command-ready",
+    )
+    parser.add_argument(
         "--command",
         action="append",
         default=[],
@@ -141,9 +147,72 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def state_name(state: dict[str, Any]) -> str:
+    return str(state.get("status_name") or "unknown")
+
+
+def query_state(client: McpStdioClient, session_id: str) -> dict[str, Any]:
+    payload = client.call_tool(
+        "windbg_get_execution_state",
+        {"session_id": session_id},
+        timeout_secs=20,
+    )
+    return payload.get("state", {})
+
+
+def wait_for_attached_state(
+    client: McpStdioClient,
+    session_id: str,
+    timeout_secs: int,
+) -> dict[str, Any]:
+    deadline = time.time() + timeout_secs
+    last_state: dict[str, Any] = {}
+    while time.time() < deadline:
+        last_state = query_state(client, session_id)
+        if state_name(last_state) != "no_debuggee":
+            return last_state
+        time.sleep(1)
+
+    return last_state
+
+
+def ensure_command_ready(
+    client: McpStdioClient,
+    session_id: str,
+    timeout_secs: int,
+) -> dict[str, Any]:
+    state = wait_for_attached_state(client, session_id, timeout_secs)
+    if state.get("ready_for_commands"):
+        return state
+
+    if state.get("running"):
+        print("interrupting:", state_name(state))
+        payload = client.call_tool(
+            "windbg_interrupt_target",
+            {"session_id": session_id},
+            timeout_secs=timeout_secs,
+        )
+        state = payload.get("state", {})
+
+    deadline = time.time() + timeout_secs
+    while not state.get("ready_for_commands") and time.time() < deadline:
+        time.sleep(1)
+        state = query_state(client, session_id)
+
+    if not state.get("ready_for_commands"):
+        raise RuntimeError(
+            "session is not ready for commands "
+            f"(status={state_name(state)}, raw={state.get('raw_status')})"
+        )
+
+    return state
+
+
 def main() -> int:
     args = parse_args()
     client = McpStdioClient(args.exe)
+    opened_session_id: str | None = None
+    closed = False
     try:
         init_id = client.send(
             "initialize",
@@ -175,31 +244,52 @@ def main() -> int:
             },
             timeout_secs=args.attach_timeout_secs + 20,
         )["session"]
+        opened_session_id = session["session_id"]
         state = session.get("state") or {}
-        print("opened:", session["session_id"], state.get("status_name"))
+        print("opened:", opened_session_id, state.get("status_name"))
+
+        if not args.command:
+            state = wait_for_attached_state(client, opened_session_id, args.ready_timeout_secs)
+            print("attached:", state_name(state))
 
         for command in args.command:
+            state = ensure_command_ready(client, opened_session_id, args.ready_timeout_secs)
+            print("ready:", state_name(state))
             result = client.call_tool(
                 "windbg_execute_command",
-                {"session_id": args.session_id, "command": command},
+                {"session_id": opened_session_id, "command": command},
                 timeout_secs=120,
             )
             print(f"command: {command}")
             print(result.get("output", "").rstrip())
 
         if not args.skip_close:
-            closed = client.call_tool(
+            closed_payload = client.call_tool(
                 "windbg_close_session",
                 {
-                    "session_id": args.session_id,
+                    "session_id": opened_session_id,
                     "shutdown_timeout_secs": args.shutdown_timeout_secs,
                 },
                 timeout_secs=args.shutdown_timeout_secs + 20,
             )
-            print("closed:", json.dumps(closed, ensure_ascii=False))
+            closed = True
+            print("closed:", json.dumps(closed_payload, ensure_ascii=False))
 
         return 0
     finally:
+        if opened_session_id and not args.skip_close and not closed:
+            try:
+                closed_payload = client.call_tool(
+                    "windbg_close_session",
+                    {
+                        "session_id": opened_session_id,
+                        "shutdown_timeout_secs": args.shutdown_timeout_secs,
+                    },
+                    timeout_secs=args.shutdown_timeout_secs + 20,
+                )
+                print("closed_after_error:", json.dumps(closed_payload, ensure_ascii=False))
+            except Exception as exc:
+                print(f"close_after_error_failed: {exc}", file=sys.stderr)
         client.close()
 
 
