@@ -1664,6 +1664,39 @@ mod windows_impl {
             self.kernel_host = None;
         }
 
+        fn resume_if_ready_for_shutdown(&self, reason: &str) {
+            match current_state(&self.control) {
+                Ok(state) if state.ready_for_commands => {
+                    tracing::debug!(
+                        status = state.raw_status,
+                        name = %state.status_name,
+                        reason,
+                        "resuming target during shutdown so the guest is not left broken"
+                    );
+                    if let Err(error) =
+                        unsafe { self.control.SetExecutionStatus(DEBUG_STATUS_GO_HANDLED) }
+                    {
+                        tracing::warn!(?error, reason, "failed to resume target during shutdown");
+                    }
+                }
+                Ok(state) => {
+                    tracing::trace!(
+                        status = state.raw_status,
+                        name = %state.status_name,
+                        reason,
+                        "target was not command-ready during shutdown resume check"
+                    );
+                }
+                Err(error) => {
+                    tracing::trace!(
+                        ?error,
+                        reason,
+                        "could not query state during shutdown resume check"
+                    );
+                }
+            }
+        }
+
         fn end_session_if_needed(&mut self) -> Result<(), ExecutionError> {
             match self.cleanup {
                 SessionCleanup::None => Ok(()),
@@ -1818,8 +1851,16 @@ mod windows_impl {
         }
 
         fn shutdown(&mut self) -> Result<(), ExecutionError> {
-            self.shutdown_host_if_needed();
-            self.end_session_if_needed()
+            if self.kernel_host.is_some() {
+                self.resume_if_ready_for_shutdown("before detach");
+                let detach_result = self.end_session_if_needed();
+                self.resume_if_ready_for_shutdown("after detach");
+                self.shutdown_host_if_needed();
+                self.resume_if_ready_for_shutdown("after host stop");
+                detach_result
+            } else {
+                self.end_session_if_needed()
+            }
         }
     }
 

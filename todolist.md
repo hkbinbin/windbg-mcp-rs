@@ -5,8 +5,11 @@
 - [x] Add bounded `windbg_close_session` teardown so live KDNET detach cannot hang the MCP server indefinitely.
   The tool now tries to resume a broken target before close, removes the session from the registry first, and reports `resume_error` / `shutdown_error` if dbgeng resume or teardown fails or times out.
 
-- [ ] Fully fix live KDNET detach correctness after `windbg_close_session`.
-  Repro seen in real runs: `LoadModule`-related errors and `0x800700D7`; session cleanup can still leave the VM paused or transport-owned even though MCP no longer blocks forever.
+- [x] Keep the VM running after `windbg_close_session` even when dbgeng detach reports `0x800700D7`.
+  Verified with ShadowGate live KDNET regression: close still returned the dbgeng error, but guest SSH stayed reachable and the driver could be stopped afterward.
+
+- [ ] Eliminate the residual `0x800700D7` / `LoadModule` error from live KDNET detach.
+  The current close path is operationally safe for the VM, but `shutdown_completed` can still be false because dbgeng rejects teardown during a nested load-module state.
 
 - [ ] Make session lifecycle resilient after tool/client interruption.
   If the client script exits mid-debug, the target should still be resumable and the session should be recoverable or self-cleaning.
@@ -14,8 +17,8 @@
 - [x] Add an MCP recovery path for "VM paused in debugger" situations.
   `windbg_recover_session` now checks state and resumes a broken target by default, or can intentionally interrupt a running target when requested.
 
-- [ ] Add an end-to-end recovery validation that confirms guest SSH is back after `windbg_recover_session`.
-  Goal: one documented command or tool flow to reopen, force `go`, and confirm guest SSH is back.
+- [x] Add an end-to-end recovery validation that confirms guest SSH is back after `windbg_recover_session`.
+  Verified after VM reboot and after ShadowGate load-break regression: `recover_session` resumed the target to `go`, and TCP/22 became reachable again.
 
 ## P0 Dynamic Debugging Usability
 
@@ -25,8 +28,11 @@
 - [ ] Add process-targeted breakpoint support for live kernel sessions.
   Preferred outcome: support a clean workflow equivalent to process-scoped breakpoints so `maze_probe.exe`/`ShadowGateApp.exe` can be traced without unrelated system hits.
 
-- [ ] Verify command execution remains stable immediately after breakpoint hits.
-  We need repeatable `break -> inspect regs/stack -> execute commands -> resume` without transient command-engine failures.
+- [x] Verify core command execution immediately after ShadowGate load breakpoint hits.
+  Verified `break -> .lastevent/lm/lmv/~/r/k/bl -> recover_session -> service RUNNING`, including the `~` fallback path.
+
+- [ ] Broaden breakpoint-hit stability testing beyond ShadowGate load events.
+  We still need repeatable syscall breakpoint workflows such as `NtCreateFile` / `NtDeviceIoControlFile` without unrelated system noise.
 
 - [x] Add a thread-list fallback for `~` when dbgeng reports transient `0x80040205`.
   The fallback uses `IDebugSystemObjects` to return current/event thread ids instead of failing outright.

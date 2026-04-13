@@ -122,6 +122,8 @@ Live-target control is split into explicit tools:
 
 If a text thread-list command such as `~` hits dbgeng's transient `0x80040205` command-window state after a synthetic load or breakpoint event, headless mode falls back to `IDebugSystemObjects` and returns a compact thread-id list instead of failing outright.
 
+Live KDNET teardown can still report dbgeng's nested `LoadModule` error (`0x800700D7`) in `shutdown_error`. Current shutdown ordering keeps the target running before stopping the host loop, so this error is reported as a teardown limitation rather than freezing the guest.
+
 ## What MCP Exposes
 
 - `Resources`: a low-context guide resource and compact/full WinDbg command documentation resources
