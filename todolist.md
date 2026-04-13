@@ -14,6 +14,9 @@
 - [ ] Make session lifecycle resilient after tool/client interruption.
   If the client script exits mid-debug, the target should still be resumable and the session should be recoverable or self-cleaning.
 
+- [ ] Add a long-running KDNET soak test.
+  Minimum target: keep the VM running under MCP control for an extended period, periodically `interrupt -> execute_command -> resume`, and verify SSH remains reachable after each cycle.
+
 - [x] Add an MCP recovery path for "VM paused in debugger" situations.
   `windbg_recover_session` now checks state and resumes a broken target by default, or can intentionally interrupt a running target when requested.
 
@@ -39,19 +42,31 @@
 
 ## P1 WinDbg Extension Support
 
-- [ ] Fix extension DLL discovery/loading in headless sessions.
-  Current `.chain` only shows `dbghelp`, `.load kdexts` fails, and commands like `!process` / `!drvobj` are unavailable.
+- [x] Fix extension DLL discovery/loading in headless sessions.
+  Headless mode now discovers WinDbg Preview, copies the runtime into a local cache outside `WindowsApps`, adds the cached `amd64\winxp` / `amd64\winext` paths to `.extpath`, and resolves `.load kdexts` to the cached DLL. Live validation shows `kdexts` loaded in `.chain` and `!process 0 0` reaches the extension.
 
-- [ ] Add explicit extension search-path setup during headless session initialization.
-  Prefer using the installed WinDbg app location rather than relying on ambient PATH state.
+- [x] Add explicit extension search-path setup during headless session initialization.
+  The session host configures `.extpath` from discovered/cache debugger directories instead of relying on ambient PATH state.
 
 - [ ] Add regression coverage for extension-backed commands.
   Minimum smoke target: `.load kdexts`, `!process 0 0`, `!drvobj ShadowGate 7`.
+
+- [ ] Make extension command failures self-diagnosing.
+  If `.load kdexts` or `!process` fails, return the effective extension search path and discovered WinDbg extension directories in the tool output.
+
+- [ ] Add a symbol bootstrap workflow for extension-backed commands.
+  Live validation now loads `kdexts` from the local WinDbg runtime cache, but `!process 0 0` reports incorrect NT symbols unless the operator configures symbols first, for example through `startup_command`.
 
 ## P1 ShadowGate Validation
 
 - [ ] Add a reproducible ShadowGate validation script to the repo.
   It should verify: open session, wait for `break`, resume, `sc start ShadowGate`, run `maze_probe.exe`, interrupt, inspect, resume.
+
+- [ ] Capture a repeatable driver-load breakpoint regression for ShadowGate.
+  It should verify `sxe ld:ShadowGateSys.sys`, service start over SSH, load breakpoint hit, `lm m ShadowGate*`, `r rip`, `k`, and clean `recover_session`.
+
+- [ ] Fix or document synthetic module display quirks after driver-load breaks.
+  The entrypoint breakpoint currently works, but stack output can show `<Unloaded_ShadowGateSys.sys>+0x8000`; this should either be corrected with better synthetic module registration or documented as cosmetic.
 
 - [ ] Capture and document the ShadowGate protocol observed so far.
   Known facts:
@@ -64,6 +79,9 @@
 
 - [ ] Add a regression test plan for `windbg_get_output`.
   Already observed working for `vertarget`; we should verify cursor-based reads across multiple commands and breakpoint hits.
+
+- [ ] Add a ShadowGate-specific command smoke suite.
+  Minimum commands: `.lastevent`, `lm m ShadowGate*`, `bl`, `~`, `r rip`, `k`, `!process 0 0`, and `!drvobj ShadowGate 7` when extensions are available.
 
 ## P2 Maintainability
 

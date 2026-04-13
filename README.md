@@ -124,6 +124,24 @@ If a text thread-list command such as `~` hits dbgeng's transient `0x80040205` c
 
 For live KDNET sessions, shutdown is owned by the host client rather than the connected command client. This avoids dbgeng's nested `LoadModule` teardown error (`0x800700D7`) after driver-load breakpoints while keeping the guest running.
 
+### Headless Extension Loading
+
+Headless mode can use WinDbg extension commands such as `.load kdexts` and `!process` without relying on WinDbg Preview's protected `WindowsApps` install path directly. On Windows, the server discovers the installed WinDbg Preview package, copies the required `amd64`, `amd64\winext`, and `amd64\winxp` runtime files into:
+
+```text
+%LOCALAPPDATA%\windbg-mcp-rs\dbgeng-cache
+```
+
+It then appends the cached extension directories to `.extpath`. Commands such as `.load kdexts` are resolved to the cached DLL path automatically.
+
+By default, live KDNET sessions keep using the system `dbgeng.dll`, which has been more stable for target resume/close behavior, while extensions load from the local cache. Advanced overrides:
+
+- `WINDBG_MCP_DBGENG_PATH`: force a specific `dbgeng.dll`.
+- `WINDBG_MCP_DEBUGGER_ROOT`: force a debugger root that contains `amd64\dbgeng.dll`.
+- `WINDBG_MCP_USE_PREVIEW_DBGENG=1`: opt into the cached WinDbg Preview `dbgeng.dll`.
+
+Extension-backed commands still depend on symbols. If `!process 0 0` reports incorrect NT symbols, pass a startup command such as `.symfix C:\Symbols; .reload /f nt` or configure `_NT_SYMBOL_PATH` before opening the session.
+
 ## What MCP Exposes
 
 - `Resources`: a low-context guide resource and compact/full WinDbg command documentation resources

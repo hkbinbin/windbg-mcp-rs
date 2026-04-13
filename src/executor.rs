@@ -706,9 +706,14 @@ impl BlockingExecutor for MockExecutor {
 #[cfg(windows)]
 mod windows_impl {
     use std::{
+        env,
+        ffi::c_void,
+        fs, mem,
         panic::{self, AssertUnwindSafe},
+        path::{Path, PathBuf},
+        process::Command,
         sync::{
-            Arc, Mutex,
+            Arc, Mutex, OnceLock,
             atomic::{AtomicBool, Ordering},
             mpsc,
         },
@@ -721,11 +726,16 @@ mod windows_impl {
             DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_CONNECT_SESSION_NO_ANNOUNCE,
             DEBUG_CONNECT_SESSION_NO_VERSION, DEBUG_ENGOPT_INITIAL_BREAK, DEBUG_EXECUTE_DEFAULT,
             DEBUG_INTERRUPT_ACTIVE, DEBUG_INTERRUPT_EXIT, DEBUG_INTERRUPT_PASSIVE,
-            DEBUG_OUTCTL_THIS_CLIENT, DEBUG_STATUS_GO_HANDLED, DebugCreate, IDebugClient,
-            IDebugClient5, IDebugControl, IDebugDataSpaces, IDebugOutputCallbacks,
-            IDebugOutputCallbacks_Impl, IDebugRegisters, IDebugSymbols3, IDebugSystemObjects3,
+            DEBUG_OUTCTL_THIS_CLIENT, DEBUG_STATUS_GO_HANDLED, IDebugClient, IDebugClient5,
+            IDebugControl, IDebugDataSpaces, IDebugOutputCallbacks, IDebugOutputCallbacks_Impl,
+            IDebugRegisters, IDebugSymbols3, IDebugSystemObjects3,
         },
-        core::{Error as WinError, HSTRING, Interface, PCSTR, Result as WinResult, implement},
+        Win32::System::LibraryLoader::{
+            GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW, SetDllDirectoryW,
+        },
+        core::{
+            Error as WinError, HRESULT, HSTRING, Interface, PCSTR, Result as WinResult, implement,
+        },
     };
 
     use super::{
@@ -740,6 +750,103 @@ mod windows_impl {
     const HRESULT_E_PENDING: i32 = 0x8000000A_u32 as i32;
     const HRESULT_E_NOTIMPL: i32 = 0x80004001_u32 as i32;
     const HRESULT_COMMAND_WINDOW_NOT_SETTLED: i32 = 0x80040205_u32 as i32;
+    const HRESULT_UNEXPECTED: HRESULT = HRESULT(0x8000FFFF_u32 as i32);
+
+    type DebugCreateFn =
+        unsafe extern "system" fn(*const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+
+    static DBGENG_MODULE: OnceLock<Result<usize, String>> = OnceLock::new();
+
+    fn debug_create<T>() -> WinResult<T>
+    where
+        T: Interface,
+    {
+        let module = dbgeng_module()?;
+        let proc_name = CString::new("DebugCreate").expect("static proc name has no NUL");
+        let proc = unsafe { GetProcAddress(module, PCSTR(proc_name.as_ptr() as _)) }
+            .ok_or_else(WinError::from_thread)?;
+        let debug_create: DebugCreateFn = unsafe { mem::transmute(proc) };
+        let mut result = core::ptr::null_mut();
+
+        unsafe {
+            debug_create(&T::IID, &mut result).and_then(|| windows_core::Type::from_abi(result))
+        }
+    }
+
+    fn dbgeng_module() -> WinResult<windows::Win32::Foundation::HMODULE> {
+        match DBGENG_MODULE.get_or_init(load_dbgeng_module) {
+            Ok(handle) => Ok(windows::Win32::Foundation::HMODULE(*handle as *mut c_void)),
+            Err(message) => Err(WinError::new(HRESULT_UNEXPECTED, message.as_str())),
+        }
+    }
+
+    fn load_dbgeng_module() -> Result<usize, String> {
+        let path = preferred_dbgeng_path();
+        if let Some(path) = path.as_ref() {
+            configure_dbgeng_dll_search_path(path);
+            tracing::debug!(
+                path = %path.display(),
+                "loading dbgeng from the preferred debugger installation"
+            );
+            let path = HSTRING::from(path.display().to_string());
+            let module = unsafe { LoadLibraryExW(&path, None, LOAD_WITH_ALTERED_SEARCH_PATH) }
+                .map_err(|error| error.to_string())?;
+            return Ok(module.0 as usize);
+        }
+
+        tracing::debug!(
+            "no preferred WinDbg dbgeng.dll was discovered; falling back to the system loader"
+        );
+        let module =
+            unsafe { LoadLibraryExW(&HSTRING::from("dbgeng.dll"), None, Default::default()) }
+                .map_err(|error| error.to_string())?;
+        Ok(module.0 as usize)
+    }
+
+    fn preferred_dbgeng_path() -> Option<PathBuf> {
+        if let Some(path) = env::var_os("WINDBG_MCP_DBGENG_PATH").map(PathBuf::from)
+            && path.is_file()
+        {
+            return Some(path);
+        }
+
+        if env_flag_enabled("WINDBG_MCP_USE_PREVIEW_DBGENG")
+            || env::var_os("WINDBG_MCP_DEBUGGER_ROOT").is_some()
+        {
+            for root in candidate_debugger_runtime_roots() {
+                let path = root.join("amd64\\dbgeng.dll");
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn env_flag_enabled(name: &str) -> bool {
+        env::var(name)
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn configure_dbgeng_dll_search_path(dbgeng_path: &Path) {
+        let Some(debugger_dir) = dbgeng_path.parent() else {
+            return;
+        };
+        let debugger_dir = HSTRING::from(debugger_dir.display().to_string());
+        if let Err(error) = unsafe { SetDllDirectoryW(&debugger_dir) } {
+            tracing::debug!(
+                ?error,
+                "failed to add the debugger directory to the DLL search path"
+            );
+        }
+    }
 
     enum HostCommand {
         AwaitCommandReady {
@@ -810,7 +917,7 @@ mod windows_impl {
                 .name("windbg-mcp-kernel-host".to_string())
                 .spawn(move || {
                     let startup = || -> Result<(), ExecutionError> {
-                        let client5 = unsafe { DebugCreate::<IDebugClient5>() }
+                        let client5 = debug_create::<IDebugClient5>()
                             .map_err(|error| ExecutionError::Startup(error.to_string()))?;
                         let options = HSTRING::from(options);
                         let initial_control = client5
@@ -869,6 +976,7 @@ mod windows_impl {
 
                         let _ = ready_tx.send(Ok(CrossThreadInterruptControl(control.clone())));
                         let mut cleared_initial_break = false;
+                        let mut configured_extensions = false;
                         let mut wait_for_event_supported = true;
 
                         while !stop_for_thread.load(Ordering::SeqCst) {
@@ -915,6 +1023,17 @@ mod windows_impl {
                                         );
                                     }
                                     cleared_initial_break = true;
+                                }
+                                if !configured_extensions {
+                                    if let Err(error) =
+                                        configure_standard_debugger_extensions(&client, &control)
+                                    {
+                                        tracing::warn!(
+                                            error = %error,
+                                            "kernel host failed to configure debugger extension paths"
+                                        );
+                                    }
+                                    configured_extensions = true;
                                 }
                                 match command_rx.recv_timeout(POLL_INTERVAL) {
                                     Ok(HostCommand::AwaitCommandReady { response }) => {
@@ -1195,12 +1314,22 @@ mod windows_impl {
         command: &str,
     ) -> Result<String, ExecutionError> {
         let mut last_retryable_reason = None;
+        let resolved_command = resolve_headless_extension_command(command);
+        let actual_command = resolved_command
+            .as_ref()
+            .map(|resolved| resolved.actual.as_str())
+            .unwrap_or(command);
 
         for attempt in 0..COMMAND_READY_RETRY_ATTEMPTS {
             sync_host_command_scope(client);
 
-            match try_execute_host_command_once(client, control, command) {
-                Ok(output) => return Ok(output),
+            match try_execute_host_command_once(client, control, actual_command) {
+                Ok(output) => {
+                    return Ok(render_resolved_command_output(
+                        resolved_command.as_ref(),
+                        output,
+                    ));
+                }
                 Err(CommandAttemptError::Retryable(reason))
                     if attempt + 1 < COMMAND_READY_RETRY_ATTEMPTS =>
                 {
@@ -1208,7 +1337,7 @@ mod windows_impl {
                         attempt = attempt + 1,
                         total_attempts = COMMAND_READY_RETRY_ATTEMPTS,
                         reason = %reason,
-                        command = %command,
+                        command = %actual_command,
                         "host command did not settle yet; retrying"
                     );
                     last_retryable_reason = Some(reason);
@@ -1222,7 +1351,7 @@ mod windows_impl {
                     }
                     return Err(ExecutionError::Command(format!(
                         "kernel host command did not settle after {} attempts while running `{}`: {}",
-                        COMMAND_READY_RETRY_ATTEMPTS, command, reason
+                        COMMAND_READY_RETRY_ATTEMPTS, actual_command, reason
                     )));
                 }
                 Err(CommandAttemptError::Fatal(error)) => return Err(error),
@@ -1231,9 +1360,334 @@ mod windows_impl {
 
         Err(ExecutionError::Command(format!(
             "kernel host command window never stabilized for `{}`. Last retryable reason: {}",
-            command,
+            actual_command,
             last_retryable_reason.unwrap_or_else(|| "unknown".to_string())
         )))
+    }
+
+    #[derive(Debug)]
+    struct ResolvedDebuggerCommand {
+        actual: String,
+        note: String,
+    }
+
+    fn resolve_headless_extension_command(command: &str) -> Option<ResolvedDebuggerCommand> {
+        let trimmed = command.trim();
+        let mut parts = trimmed.split_whitespace();
+        let verb = parts.next()?;
+        if !verb.eq_ignore_ascii_case(".load") {
+            return None;
+        }
+
+        let requested = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+
+        let requested = requested.trim_matches('"').trim_matches('\'');
+        let normalized = requested
+            .strip_suffix(".dll")
+            .unwrap_or(requested)
+            .to_ascii_lowercase();
+        if !matches!(
+            normalized.as_str(),
+            "kdexts" | "ext" | "kext" | "ntsdexts" | "wdfkd"
+        ) {
+            return None;
+        }
+
+        let dll_name = format!("{normalized}.dll");
+        let path = find_debugger_extension_dll(&dll_name)?;
+        Some(ResolvedDebuggerCommand {
+            actual: format!(".load {}", quote_debugger_load_path(&path)),
+            note: format!(
+                "Resolved `{}` to `{}` for this headless session.",
+                trimmed,
+                path.display()
+            ),
+        })
+    }
+
+    fn render_resolved_command_output(
+        resolved: Option<&ResolvedDebuggerCommand>,
+        output: String,
+    ) -> String {
+        let Some(resolved) = resolved else {
+            return output;
+        };
+
+        let mut rendered = String::new();
+        rendered.push_str(&resolved.note);
+        rendered.push('\n');
+        rendered.push_str(&output);
+        rendered
+    }
+
+    fn configure_standard_debugger_extensions(
+        client: &IDebugClient,
+        control: &IDebugControl,
+    ) -> Result<(), ExecutionError> {
+        let dirs = discover_debugger_extension_dirs();
+        if dirs.is_empty() {
+            tracing::warn!(
+                "no WinDbg extension directories were discovered; extension commands may require manual .extpath setup"
+            );
+            return Ok(());
+        }
+
+        let extpath = dirs
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(";");
+        let command = format!(".extpath+ {}", quote_debugger_path_text(&extpath));
+        let output = execute_host_command_with_retry(client, control, &command)?;
+        tracing::debug!(
+            directories = ?dirs,
+            output = %output,
+            "configured debugger extension search path"
+        );
+
+        for dll_name in ["kdexts.dll", "ext.dll", "kext.dll"] {
+            if let Some(path) = find_debugger_extension_dll_in_dirs(&dirs, dll_name) {
+                if let Err(error) = add_debugger_extension(control, &path) {
+                    tracing::debug!(
+                        dll = dll_name,
+                        path = %path.display(),
+                        ?error,
+                        "standard debugger extension could not be preloaded"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn add_debugger_extension(control: &IDebugControl, path: &Path) -> Result<u64, WinError> {
+        let path = CString::new(path.display().to_string()).map_err(|_| {
+            WinError::new(
+                windows::core::HRESULT(0x80070057_u32 as i32),
+                "debugger extension path contains an interior NUL",
+            )
+        })?;
+        let path = PCSTR(path.as_ptr() as _);
+
+        if let Ok(handle) = unsafe { control.GetExtensionByPath(path) } {
+            return Ok(handle);
+        }
+
+        unsafe { control.AddExtension(path, 0) }
+    }
+
+    fn find_debugger_extension_dll(dll_name: &str) -> Option<PathBuf> {
+        find_debugger_extension_dll_in_dirs(&discover_debugger_extension_dirs(), dll_name)
+    }
+
+    fn find_debugger_extension_dll_in_dirs(dirs: &[PathBuf], dll_name: &str) -> Option<PathBuf> {
+        dirs.iter()
+            .map(|dir| dir.join(dll_name))
+            .find(|path| path.is_file())
+    }
+
+    fn discover_debugger_extension_dirs() -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+
+        if let Ok(value) = env::var("_NT_DEBUGGER_EXTENSION_PATH") {
+            for path in env::split_paths(&value) {
+                push_existing_dir(&mut dirs, path);
+            }
+        }
+
+        for root in candidate_debugger_runtime_roots() {
+            for relative in ["amd64\\winxp", "amd64\\winext", "amd64"] {
+                push_existing_dir(&mut dirs, root.join(relative));
+            }
+        }
+
+        for root in candidate_windows_kits_debugger_roots() {
+            for relative in ["winxp", "winext", ""] {
+                push_existing_dir(&mut dirs, root.join(relative));
+            }
+        }
+
+        dirs
+    }
+
+    fn candidate_debugger_runtime_roots() -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+
+        if let Some(root) = env::var_os("WINDBG_MCP_DEBUGGER_ROOT").map(PathBuf::from) {
+            push_existing_dir(&mut roots, root);
+        }
+
+        for package_root in candidate_windbg_package_roots() {
+            if let Some(cache_root) = materialize_windbg_runtime_cache(&package_root) {
+                push_existing_dir(&mut roots, cache_root);
+            } else {
+                push_existing_dir(&mut roots, package_root);
+            }
+        }
+
+        roots
+    }
+
+    fn candidate_windbg_package_roots() -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        let Some(program_files) = env::var_os("ProgramFiles").map(PathBuf::from) else {
+            return roots;
+        };
+        let windows_apps = program_files.join("WindowsApps");
+        let mut packages = fs::read_dir(windows_apps)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .filter_map(|entry| {
+                let file_name = entry.file_name();
+                let file_name = file_name.to_string_lossy();
+                if file_name.starts_with("Microsoft.WinDbg_")
+                    && file_name.contains("_x64__")
+                    && entry.path().is_dir()
+                {
+                    Some(entry.path())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Some(path) = query_windbg_appx_install_location() {
+            packages.push(path);
+        }
+        packages.sort_by(|left, right| right.cmp(left));
+        for package in packages {
+            push_existing_dir(&mut roots, package);
+        }
+        roots
+    }
+
+    fn materialize_windbg_runtime_cache(package_root: &Path) -> Option<PathBuf> {
+        let package_name = package_root.file_name()?.to_string_lossy();
+        let local_app_data = env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
+        let cache_root = local_app_data
+            .join("windbg-mcp-rs")
+            .join("dbgeng-cache")
+            .join(package_name.as_ref());
+
+        for relative in ["amd64", "amd64\\winext", "amd64\\winxp"] {
+            let source = package_root.join(relative);
+            if let Err(error) = copy_runtime_dir_files(&source, &cache_root.join(relative)) {
+                tracing::debug!(
+                    source = %source.display(),
+                    cache = %cache_root.display(),
+                    ?error,
+                    "failed to copy WinDbg runtime files into the local cache"
+                );
+                return None;
+            }
+        }
+
+        if cache_root.join("amd64\\dbgeng.dll").is_file() {
+            Some(cache_root)
+        } else {
+            None
+        }
+    }
+
+    fn copy_runtime_dir_files(source: &Path, destination: &Path) -> std::io::Result<()> {
+        if !source.is_dir() {
+            return Ok(());
+        }
+
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let source_file = entry.path();
+            let destination_file = destination.join(entry.file_name());
+            if should_copy_runtime_file(&source_file, &destination_file)? {
+                fs::copy(&source_file, &destination_file)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn should_copy_runtime_file(source: &Path, destination: &Path) -> std::io::Result<bool> {
+        let source_metadata = source.metadata()?;
+        let Ok(destination_metadata) = destination.metadata() else {
+            return Ok(true);
+        };
+
+        Ok(source_metadata.len() != destination_metadata.len())
+    }
+
+    fn query_windbg_appx_install_location() -> Option<PathBuf> {
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-AppxPackage Microsoft.WinDbg | Select-Object -First 1 -ExpandProperty InstallLocation)",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            tracing::debug!(
+                status = ?output.status.code(),
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "Get-AppxPackage Microsoft.WinDbg did not return an install location"
+            );
+            return None;
+        }
+
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .find(|path| path.is_dir())
+    }
+
+    fn candidate_windows_kits_debugger_roots() -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        for env_name in ["ProgramFiles(x86)", "ProgramFiles"] {
+            let Some(program_files) = env::var_os(env_name).map(PathBuf::from) else {
+                continue;
+            };
+            push_existing_dir(
+                &mut roots,
+                program_files.join("Windows Kits\\10\\Debuggers\\x64"),
+            );
+        }
+        roots
+    }
+
+    fn push_existing_dir(dirs: &mut Vec<PathBuf>, path: PathBuf) {
+        if !path.is_dir() {
+            return;
+        }
+
+        let normalized = path.display().to_string().to_ascii_lowercase();
+        if dirs
+            .iter()
+            .any(|existing| existing.display().to_string().to_ascii_lowercase() == normalized)
+        {
+            return;
+        }
+
+        dirs.push(path);
+    }
+
+    fn quote_debugger_load_path(path: &Path) -> String {
+        quote_debugger_path_text(&path.display().to_string().replace('\\', "\\\\"))
+    }
+
+    fn quote_debugger_path_text(path: &str) -> String {
+        format!("\"{}\"", path.replace('"', "\\\""))
     }
 
     fn sync_host_command_scope(client: &IDebugClient) {
@@ -1435,7 +1889,7 @@ mod windows_impl {
 
     impl DbgEngExecutor {
         pub(crate) fn connect_session() -> Result<Self, ExecutionError> {
-            let client = unsafe { DebugCreate::<IDebugClient>() }
+            let client = debug_create::<IDebugClient>()
                 .map_err(|error| ExecutionError::Startup(error.to_string()))?;
 
             unsafe {
