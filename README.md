@@ -115,6 +115,8 @@ Live-target control is split into explicit tools:
 - `windbg_resume_target`
 - `windbg_execute_command`
 
+`windbg_close_session` tries to resume a broken target before teardown by default; pass `resume_before_close: false` to skip that behavior. It also accepts an optional `shutdown_timeout_secs` value. The session is removed from the MCP registry first, and the bounded shutdown result reports whether dbgeng teardown completed cleanly or timed out in the background. This keeps live KDNET detach issues from hanging the MCP server.
+
 ## What MCP Exposes
 
 - `Resources`: a low-context guide resource and compact/full WinDbg command documentation resources

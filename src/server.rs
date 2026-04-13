@@ -60,6 +60,8 @@ struct OpenSessionArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CloseSessionArgs {
     session_id: String,
+    shutdown_timeout_secs: Option<u64>,
+    resume_before_close: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -179,7 +181,7 @@ impl WindbgMcpServer {
     fn close_session_tool(&self) -> Tool {
         Tool::new(
             "windbg_close_session",
-            "Close a headless debugger session and detach the owned dbgeng client from the target.",
+            "Close a headless debugger session and detach the owned dbgeng client from the target. By default this tries to resume a broken target before closing; set `resume_before_close` to false to skip that. `shutdown_timeout_secs` bounds teardown so a live KDNET detach cannot hang the MCP server indefinitely.",
             schema_for_type::<CloseSessionArgs>(),
         )
         .with_title("Close headless session")
@@ -544,7 +546,11 @@ impl ServerHandler for WindbgMcpServer {
                 };
                 let args: CloseSessionArgs = self.parse_arguments(request.arguments)?;
                 let result = sessions
-                    .close_session(&args.session_id)
+                    .close_session(
+                        &args.session_id,
+                        args.shutdown_timeout_secs,
+                        args.resume_before_close,
+                    )
                     .await
                     .map_err(Self::map_execution_error)?;
                 Ok(CallToolResult::structured(json!(result)))

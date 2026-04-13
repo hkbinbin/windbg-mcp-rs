@@ -5,6 +5,7 @@ use std::{
 };
 
 use serde::Serialize;
+use tokio::time::timeout;
 
 use crate::executor::{
     CommandDispatcher, CommandExecutionResult, DebuggerExecutionState, ExecutionError,
@@ -35,12 +36,22 @@ pub struct CloseSessionResult {
     pub closed_session_id: String,
     pub default_session_id: Option<String>,
     pub remaining_sessions: usize,
+    pub resume_before_close: bool,
+    pub resume_attempted: bool,
+    pub resume_error: Option<String>,
+    pub shutdown_completed: bool,
+    pub shutdown_error: Option<String>,
+    pub shutdown_timeout_secs: u64,
 }
 
 #[derive(Clone, Default)]
 pub struct HeadlessSessionManager {
     inner: Arc<Mutex<SessionRegistry>>,
 }
+
+const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_CLOSE_RESUME_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_RESUME_BEFORE_CLOSE: bool = true;
 
 struct SessionRegistry {
     sessions: HashMap<String, ManagedSession>,
@@ -175,6 +186,8 @@ impl HeadlessSessionManager {
     pub async fn close_session(
         &self,
         session_id: &str,
+        shutdown_timeout_secs: Option<u64>,
+        resume_before_close: Option<bool>,
     ) -> Result<CloseSessionResult, ExecutionError> {
         let (dispatcher, session_id, default_session_id, remaining_sessions) = {
             let mut registry = self
@@ -198,12 +211,42 @@ impl HeadlessSessionManager {
             )
         };
 
-        dispatcher.shutdown().await?;
+        let resume_before_close = resume_before_close.unwrap_or(DEFAULT_RESUME_BEFORE_CLOSE);
+        let (resume_attempted, resume_error) = if resume_before_close {
+            resume_session_before_close(&dispatcher).await
+        } else {
+            (false, None)
+        };
+
+        let shutdown_timeout =
+            Duration::from_secs(shutdown_timeout_secs.unwrap_or(DEFAULT_CLOSE_TIMEOUT.as_secs()));
+        let (shutdown_completed, shutdown_error) = match timeout(
+            shutdown_timeout,
+            dispatcher.shutdown(),
+        )
+        .await
+        {
+            Ok(Ok(())) => (true, None),
+            Ok(Err(error)) => (false, Some(error.to_string())),
+            Err(_) => (
+                false,
+                Some(format!(
+                    "timed out after {} seconds while waiting for session shutdown; the session was removed from the MCP registry, but dbgeng may still be detaching in the background",
+                    shutdown_timeout.as_secs()
+                )),
+            ),
+        };
 
         Ok(CloseSessionResult {
             closed_session_id: session_id,
             default_session_id,
             remaining_sessions,
+            resume_before_close,
+            resume_attempted,
+            resume_error,
+            shutdown_completed,
+            shutdown_error,
+            shutdown_timeout_secs: shutdown_timeout.as_secs(),
         })
     }
 
@@ -440,6 +483,48 @@ fn timestamp_now_ms() -> u64 {
         .as_millis() as u64
 }
 
+async fn resume_session_before_close(dispatcher: &CommandDispatcher) -> (bool, Option<String>) {
+    let state = match timeout(DEFAULT_CLOSE_RESUME_TIMEOUT, dispatcher.query_state()).await {
+        Ok(Ok(state)) => state,
+        Ok(Err(error)) => return (false, Some(error.to_string())),
+        Err(_) => {
+            return (
+                false,
+                Some(format!(
+                    "timed out after {} seconds while checking whether the target should be resumed before close",
+                    DEFAULT_CLOSE_RESUME_TIMEOUT.as_secs()
+                )),
+            );
+        }
+    };
+
+    if state.running {
+        return (false, None);
+    }
+
+    if !state.ready_for_commands {
+        return (
+            false,
+            Some(format!(
+                "target was not resumed before close because debugger status is {} ({}): {}",
+                state.status_name, state.raw_status, state.summary
+            )),
+        );
+    }
+
+    match timeout(DEFAULT_CLOSE_RESUME_TIMEOUT, dispatcher.resume()).await {
+        Ok(Ok(_)) => (true, None),
+        Ok(Err(error)) => (true, Some(error.to_string())),
+        Err(_) => (
+            true,
+            Some(format!(
+                "timed out after {} seconds while resuming the target before close",
+                DEFAULT_CLOSE_RESUME_TIMEOUT.as_secs()
+            )),
+        ),
+    }
+}
+
 fn normalize_kernel_connect_options(raw: &str) -> Result<String, ExecutionError> {
     let normalized_dashes = raw.replace(['–', '—'], "-");
     let trimmed = normalized_dashes.trim().trim_matches('"');
@@ -487,6 +572,36 @@ mod tests {
             .await
             .expect("command should execute");
         assert_eq!(result.output, "register dump");
+    }
+
+    #[tokio::test]
+    async fn close_session_removes_session_and_reports_shutdown_status() {
+        let manager = HeadlessSessionManager::new();
+        manager
+            .open_mock_session("session-01", HashMap::new())
+            .await
+            .expect("mock session should open");
+
+        let result = manager
+            .close_session("session-01", Some(1), None)
+            .await
+            .expect("close should remove the session");
+
+        assert_eq!(result.closed_session_id, "session-01");
+        assert_eq!(result.remaining_sessions, 0);
+        assert_eq!(result.default_session_id, None);
+        assert!(result.resume_before_close);
+        assert!(result.resume_attempted);
+        assert_eq!(result.resume_error, None);
+        assert!(result.shutdown_completed);
+        assert_eq!(result.shutdown_error, None);
+        assert_eq!(result.shutdown_timeout_secs, 1);
+
+        let error = manager
+            .execute_command(Some("session-01"), "r".to_string())
+            .await
+            .expect_err("closed session should no longer be routable");
+        assert!(matches!(error, ExecutionError::Session(_)));
     }
 
     #[tokio::test]

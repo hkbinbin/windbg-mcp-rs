@@ -737,6 +737,7 @@ mod windows_impl {
     const POLL_INTERVAL: Duration = Duration::from_millis(250);
     const COMMAND_READY_RETRY_DELAY: Duration = Duration::from_millis(100);
     const COMMAND_READY_RETRY_ATTEMPTS: usize = 8;
+    const HOST_COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
     const HRESULT_E_PENDING: i32 = 0x8000000A_u32 as i32;
     const HRESULT_E_NOTIMPL: i32 = 0x80004001_u32 as i32;
     const HRESULT_COMMAND_WINDOW_NOT_SETTLED: i32 = 0x80040205_u32 as i32;
@@ -1089,8 +1090,13 @@ mod windows_impl {
                 })
                 .map_err(|_| self.worker_stopped_error())?;
             response_rx
-                .recv()
-                .map_err(|_| self.worker_stopped_error())?
+                .recv_timeout(INTERRUPT_WAIT_TIMEOUT)
+                .map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => ExecutionError::Command(
+                        "timed out waiting for the kernel host to resume the target".to_string(),
+                    ),
+                    mpsc::RecvTimeoutError::Disconnected => self.worker_stopped_error(),
+                })?
         }
 
         fn await_command_ready(&self) -> Result<DebuggerExecutionState, ExecutionError> {
@@ -1121,8 +1127,15 @@ mod windows_impl {
                 })
                 .map_err(|_| self.worker_stopped_error())?;
             response_rx
-                .recv()
-                .map_err(|_| self.worker_stopped_error())?
+                .recv_timeout(HOST_COMMAND_RESPONSE_TIMEOUT)
+                .map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => ExecutionError::Command(format!(
+                        "timed out after {} seconds waiting for the kernel host to execute `{}`",
+                        HOST_COMMAND_RESPONSE_TIMEOUT.as_secs(),
+                        command
+                    )),
+                    mpsc::RecvTimeoutError::Disconnected => self.worker_stopped_error(),
+                })?
         }
     }
 
@@ -1689,6 +1702,12 @@ mod windows_impl {
             let state = self.refresh_state()?;
             if state.running {
                 return Ok(state);
+            }
+            if !state.ready_for_commands {
+                return Err(ExecutionError::Command(format!(
+                    "target cannot be resumed while debugger status is {} ({}). {}",
+                    state.status_name, state.raw_status, state.summary
+                )));
             }
 
             if let Some(host) = &self.kernel_host {

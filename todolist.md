@@ -2,8 +2,11 @@
 
 ## P0 Core Reliability
 
-- [ ] Fix `windbg_close_session` hanging/failing during live KDNET teardown.
-  Repro seen in real runs: `LoadModule`-related errors and `0x800700D7`; session cleanup can leave the VM paused or transport-owned.
+- [x] Add bounded `windbg_close_session` teardown so live KDNET detach cannot hang the MCP server indefinitely.
+  The tool now tries to resume a broken target before close, removes the session from the registry first, and reports `resume_error` / `shutdown_error` if dbgeng resume or teardown fails or times out.
+
+- [ ] Fully fix live KDNET detach correctness after `windbg_close_session`.
+  Repro seen in real runs: `LoadModule`-related errors and `0x800700D7`; session cleanup can still leave the VM paused or transport-owned even though MCP no longer blocks forever.
 
 - [ ] Make session lifecycle resilient after tool/client interruption.
   If the client script exits mid-debug, the target should still be resumable and the session should be recoverable or self-cleaning.
