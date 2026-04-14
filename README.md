@@ -158,7 +158,7 @@ Additional tracked validation helpers:
 - `tools/headless_syscall_breakpoint_smoke.py`: validates process-scoped syscall breakpoint setup and can optionally launch a trigger command.
 - `tools/shadowgate_smoke.py`: drives ShadowGate service/load-break inspections when guest SSH is available.
 
-For day-to-day operating guidance, see `docs/headless-operator-guide.md`. For output cursor regression coverage, see `docs/get-output-regression-plan.md`.
+For day-to-day operating guidance, see `docs/headless-operator-guide.md`. Driver-debugging implementation details are tracked in `docs/kernel-driver-debugging-implementation.md`. For output cursor regression coverage, see `docs/get-output-regression-plan.md`.
 ShadowGate-specific observations are tracked in `docs/shadowgate-notes.md`.
 
 ## Notes

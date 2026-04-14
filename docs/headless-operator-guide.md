@@ -73,6 +73,8 @@ windbg_resume_target
 
 `windbg_set_driver_load_breakpoint` prepares `nt` symbols by default before it mutates `sxe/sxd ld:<image>` filters, because some dbgeng builds are unstable when symbol preparation happens after synthetic load-filter changes. `windbg_driver_summary` parses the `!drvobj <name> 7` dispatch table into structured `IRP_MJ_*` entries so an MCP client can choose handlers without scraping raw text. `windbg_set_driver_dispatch_breakpoints` targets create/close/device-control handlers when present and skips default `nt!IopInvalidDeviceRequest` handlers unless `include_default_handlers` is true.
 
+For implementation details, parser behavior, validation notes, and maintenance cautions, see `docs/kernel-driver-debugging-implementation.md`.
+
 ## Driver Load Breakpoints
 
 Use `windbg_set_driver_load_breakpoint` for synthetic load-event breakpoints, or use normal WinDbg syntax directly:
