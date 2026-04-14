@@ -3,9 +3,6 @@ name = "windbg-mcp-rs"
 version = "0.1.2"
 edition = "2024"
 
-[lib]
-crate-type = ["rlib", "cdylib"]
-
 [dependencies]
 axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }

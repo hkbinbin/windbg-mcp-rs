@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf, process::Command, time::Duration};
 
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, handler::server::common::schema_for_type,
@@ -69,6 +69,115 @@ struct DiagnoseExtensionsArgs {
     module: Option<String>,
     symbol_cache: Option<String>,
     symbol_server: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ListBreakpointsArgs {
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetBreakpointArgs {
+    session_id: Option<String>,
+    location: String,
+    kind: Option<String>,
+    one_shot: Option<bool>,
+    pass_count: Option<u32>,
+    command: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ClearBreakpointArgs {
+    session_id: Option<String>,
+    breakpoint: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ReadRegistersArgs {
+    session_id: Option<String>,
+    registers: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WriteRegisterArgs {
+    session_id: Option<String>,
+    register: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReadMemoryArgs {
+    session_id: Option<String>,
+    address: String,
+    format: Option<String>,
+    count: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct DisassembleArgs {
+    session_id: Option<String>,
+    address: Option<String>,
+    count: Option<u32>,
+    before: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct BacktraceArgs {
+    session_id: Option<String>,
+    format: Option<String>,
+    count: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct SnapshotMemoryArgs {
+    address: String,
+    format: Option<String>,
+    count: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct BreakpointSnapshotArgs {
+    session_id: Option<String>,
+    stack_format: Option<String>,
+    stack_count: Option<u32>,
+    disassemble_count: Option<u32>,
+    stack_memory_count: Option<u32>,
+    memory: Option<Vec<SnapshotMemoryArgs>>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ContinueUntilBreakArgs {
+    session_id: Option<String>,
+    timeout_secs: Option<u64>,
+    poll_interval_millis: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct EvaluateExpressionArgs {
+    session_id: Option<String>,
+    expression: String,
+    evaluator: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ListModulesArgs {
+    session_id: Option<String>,
+    pattern: Option<String>,
+    verbose: Option<bool>,
+    unloaded: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SearchSymbolsArgs {
+    session_id: Option<String>,
+    pattern: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct InspectDriverArgs {
+    session_id: Option<String>,
+    name: String,
+    flags: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -187,6 +296,71 @@ fn chain_contains_extension(chain_output: &str, extension: &str) -> bool {
         && (chain.contains(&extension) || chain.contains(&format!("{extension}.dll")))
 }
 
+fn quote_debugger_command(command: &str) -> String {
+    format!("\"{}\"", command.replace('"', "\\\""))
+}
+
+fn trimmed_nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn clamp_count(value: Option<u32>, default: u32, max: u32) -> u32 {
+    value.unwrap_or(default).clamp(1, max)
+}
+
+fn memory_command(
+    address: &str,
+    format: Option<&str>,
+    count: Option<u32>,
+) -> Result<String, String> {
+    let address = address.trim();
+    if address.is_empty() {
+        return Err("memory address cannot be empty".to_string());
+    }
+
+    let format = format.unwrap_or("qwords").trim().to_ascii_lowercase();
+    let command = match format.as_str() {
+        "b" | "byte" | "bytes" | "db" => {
+            format!("db {address} L{}", clamp_count(count, 64, 4096))
+        }
+        "w" | "word" | "words" | "dw" => {
+            format!("dw {address} L{}", clamp_count(count, 32, 2048))
+        }
+        "d" | "dword" | "dwords" | "dd" => {
+            format!("dd {address} L{}", clamp_count(count, 32, 2048))
+        }
+        "q" | "qword" | "qwords" | "dq" | "pointer" | "pointers" => {
+            format!("dq {address} L{}", clamp_count(count, 16, 1024))
+        }
+        "ascii" | "a" | "da" => format!("da {address}"),
+        "unicode" | "u16" | "du" => format!("du {address}"),
+        "poi" | "deref" => format!("dq poi({address}) L{}", clamp_count(count, 16, 1024)),
+        _ => {
+            return Err(format!(
+                "unsupported memory format `{format}`; expected bytes, words, dwords, qwords, ascii, unicode, or poi"
+            ));
+        }
+    };
+    Ok(command)
+}
+
+fn backtrace_command(format: Option<&str>, count: Option<u32>) -> Result<String, String> {
+    let requested = trimmed_nonempty(format).unwrap_or("kv");
+    let command = match requested {
+        value if value.eq_ignore_ascii_case("k") => "k",
+        value if value.eq_ignore_ascii_case("kb") => "kb",
+        "kP" => "kP",
+        value if value.eq_ignore_ascii_case("kp") => "kp",
+        value if value.eq_ignore_ascii_case("kv") => "kv",
+        _ => {
+            return Err(format!(
+                "unsupported backtrace format `{requested}`; expected k, kb, kp, kP, or kv"
+            ));
+        }
+    };
+    Ok(format!("{} {}", command, clamp_count(count, 32, 512)))
+}
+
 fn default_symbol_cache_dir() -> PathBuf {
     std::env::var_os("WINDBG_MCP_SYMBOL_CACHE")
         .map(PathBuf::from)
@@ -301,6 +475,132 @@ impl WindbgMcpServer {
         .with_title("Diagnose debugger extensions")
     }
 
+    fn set_breakpoint_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_set_breakpoint",
+            "Set a code breakpoint with `bp`, `bu`, or `bm`, then return the updated `bl` listing. Supports one-shot breakpoints, pass counts, and WinDbg command strings.",
+            schema_for_type::<SetBreakpointArgs>(),
+        )
+        .with_title("Set breakpoint")
+    }
+
+    fn list_breakpoints_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_list_breakpoints",
+            "List debugger breakpoints using `bl`.",
+            schema_for_type::<ListBreakpointsArgs>(),
+        )
+        .with_title("List breakpoints")
+    }
+
+    fn clear_breakpoint_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_clear_breakpoint",
+            "Clear a breakpoint using `bc`. Omit `breakpoint` to clear all breakpoints.",
+            schema_for_type::<ClearBreakpointArgs>(),
+        )
+        .with_title("Clear breakpoint")
+    }
+
+    fn read_registers_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_read_registers",
+            "Read registers using `r`. Omit `registers` for the standard register set.",
+            schema_for_type::<ReadRegistersArgs>(),
+        )
+        .with_title("Read registers")
+    }
+
+    fn write_register_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_write_register",
+            "Write one register using `r <register>=<value>` and return the resulting register output.",
+            schema_for_type::<WriteRegisterArgs>(),
+        )
+        .with_title("Write register")
+    }
+
+    fn read_memory_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_read_memory",
+            "Read target memory. Supported formats: bytes/db, words/dw, dwords/dd, qwords/dq, ascii/da, unicode/du, and poi/deref.",
+            schema_for_type::<ReadMemoryArgs>(),
+        )
+        .with_title("Read memory")
+    }
+
+    fn disassemble_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_disassemble",
+            "Disassemble around an address using `u` or `ub`. Omit `address` to disassemble at the current instruction pointer.",
+            schema_for_type::<DisassembleArgs>(),
+        )
+        .with_title("Disassemble")
+    }
+
+    fn backtrace_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_backtrace",
+            "Show a stack backtrace using `k`, `kb`, `kp`, or `kv`.",
+            schema_for_type::<BacktraceArgs>(),
+        )
+        .with_title("Backtrace")
+    }
+
+    fn breakpoint_snapshot_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_breakpoint_snapshot",
+            "Collect a common breakpoint-hit snapshot: `.lastevent`, registers, backtrace, disassembly at RIP, stack memory, breakpoint list, and optional extra memory reads.",
+            schema_for_type::<BreakpointSnapshotArgs>(),
+        )
+        .with_title("Breakpoint snapshot")
+    }
+
+    fn continue_until_break_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_continue_until_break",
+            "Resume the target with `windbg_resume_target` and poll execution state until the target breaks again or a timeout expires.",
+            schema_for_type::<ContinueUntilBreakArgs>(),
+        )
+        .with_title("Continue until break")
+    }
+
+    fn evaluate_expression_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_evaluate_expression",
+            "Evaluate a debugger expression with the MASM `?` evaluator by default, or C++ `??` when `evaluator` is `cpp`.",
+            schema_for_type::<EvaluateExpressionArgs>(),
+        )
+        .with_title("Evaluate expression")
+    }
+
+    fn list_modules_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_list_modules",
+            "List loaded or unloaded modules using `lm`, with optional `pattern`, `verbose`, and `unloaded` flags.",
+            schema_for_type::<ListModulesArgs>(),
+        )
+        .with_title("List modules")
+    }
+
+    fn search_symbols_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_search_symbols",
+            "Search symbols with `x <pattern>`, for example `nt!*CreateFile*` or `ShadowGate*!*`.",
+            schema_for_type::<SearchSymbolsArgs>(),
+        )
+        .with_title("Search symbols")
+    }
+
+    fn inspect_driver_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_inspect_driver",
+            "Inspect a kernel driver object with `!drvobj <name> <flags>`. Defaults to flags `7`.",
+            schema_for_type::<InspectDriverArgs>(),
+        )
+        .with_title("Inspect driver object")
+    }
+
     fn interrupt_tool(&self) -> Tool {
         Tool::new(
             "windbg_interrupt_target",
@@ -408,6 +708,20 @@ impl WindbgMcpServer {
             self.output_tool(),
             self.prepare_symbols_tool(),
             self.diagnose_extensions_tool(),
+            self.set_breakpoint_tool(),
+            self.list_breakpoints_tool(),
+            self.clear_breakpoint_tool(),
+            self.read_registers_tool(),
+            self.write_register_tool(),
+            self.read_memory_tool(),
+            self.disassemble_tool(),
+            self.backtrace_tool(),
+            self.breakpoint_snapshot_tool(),
+            self.continue_until_break_tool(),
+            self.evaluate_expression_tool(),
+            self.list_modules_tool(),
+            self.search_symbols_tool(),
+            self.inspect_driver_tool(),
             self.search_tool(),
             self.interrupt_tool(),
             self.resume_tool(),
@@ -722,6 +1036,279 @@ impl WindbgMcpServer {
         }))
     }
 
+    async fn set_breakpoint(&self, args: SetBreakpointArgs) -> Result<Value, McpError> {
+        let location = args.location.trim();
+        if location.is_empty() {
+            return Err(McpError::invalid_params(
+                "breakpoint location cannot be empty",
+                None,
+            ));
+        }
+
+        let kind = args
+            .kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("bp")
+            .to_ascii_lowercase();
+        if !matches!(kind.as_str(), "bp" | "bu" | "bm") {
+            return Err(McpError::invalid_params(
+                "breakpoint kind must be `bp`, `bu`, or `bm`",
+                None,
+            ));
+        }
+
+        let mut command = kind;
+        if args.one_shot.unwrap_or(false) {
+            command.push_str(" /1");
+        }
+        command.push(' ');
+        command.push_str(location);
+        if let Some(pass_count) = args.pass_count {
+            command.push(' ');
+            command.push_str(&pass_count.to_string());
+        }
+        if let Some(command_string) = trimmed_nonempty(args.command.as_deref()) {
+            command.push(' ');
+            command.push_str(&quote_debugger_command(command_string));
+        }
+
+        let set = self
+            .execute_debugger_command(args.session_id.as_deref(), command)
+            .await?;
+        let list = self
+            .execute_debugger_command(args.session_id.as_deref(), "bl".to_string())
+            .await?;
+
+        Ok(json!({
+            "breakpoint": render_execution_result(set),
+            "breakpoints": render_execution_result(list),
+        }))
+    }
+
+    async fn list_breakpoints(&self, args: ListBreakpointsArgs) -> Result<Value, McpError> {
+        self.execute_command(args.session_id.as_deref(), "bl".to_string())
+            .await
+    }
+
+    async fn clear_breakpoint(&self, args: ClearBreakpointArgs) -> Result<Value, McpError> {
+        let breakpoint = trimmed_nonempty(args.breakpoint.as_deref()).unwrap_or("*");
+        let clear = self
+            .execute_debugger_command(args.session_id.as_deref(), format!("bc {breakpoint}"))
+            .await?;
+        let list = self
+            .execute_debugger_command(args.session_id.as_deref(), "bl".to_string())
+            .await?;
+
+        Ok(json!({
+            "clear": render_execution_result(clear),
+            "breakpoints": render_execution_result(list),
+        }))
+    }
+
+    async fn read_registers(&self, args: ReadRegistersArgs) -> Result<Value, McpError> {
+        let command = match args.registers {
+            Some(registers) => {
+                let registers: Vec<String> = registers
+                    .into_iter()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .collect();
+                if registers.is_empty() {
+                    "r".to_string()
+                } else {
+                    registers
+                        .into_iter()
+                        .map(|register| format!("r {register}"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                }
+            }
+            None => "r".to_string(),
+        };
+
+        self.execute_command(args.session_id.as_deref(), command)
+            .await
+    }
+
+    async fn write_register(&self, args: WriteRegisterArgs) -> Result<Value, McpError> {
+        let register = args.register.trim();
+        let value = args.value.trim();
+        if register.is_empty() || value.is_empty() {
+            return Err(McpError::invalid_params(
+                "register and value cannot be empty",
+                None,
+            ));
+        }
+
+        self.execute_command(
+            args.session_id.as_deref(),
+            format!("r {register}={value}; r {register}"),
+        )
+        .await
+    }
+
+    async fn read_memory(&self, args: ReadMemoryArgs) -> Result<Value, McpError> {
+        let command = memory_command(&args.address, args.format.as_deref(), args.count)
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        self.execute_command(args.session_id.as_deref(), command)
+            .await
+    }
+
+    async fn disassemble(&self, args: DisassembleArgs) -> Result<Value, McpError> {
+        let verb = if args.before.unwrap_or(false) {
+            "ub"
+        } else {
+            "u"
+        };
+        let address = trimmed_nonempty(args.address.as_deref()).unwrap_or(".");
+        let count = clamp_count(args.count, 16, 512);
+        self.execute_command(
+            args.session_id.as_deref(),
+            format!("{verb} {address} L{count}"),
+        )
+        .await
+    }
+
+    async fn backtrace(&self, args: BacktraceArgs) -> Result<Value, McpError> {
+        let command = backtrace_command(args.format.as_deref(), args.count)
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        self.execute_command(args.session_id.as_deref(), command)
+            .await
+    }
+
+    async fn breakpoint_snapshot(&self, args: BreakpointSnapshotArgs) -> Result<Value, McpError> {
+        let mut commands = vec![
+            ".lastevent".to_string(),
+            "r".to_string(),
+            backtrace_command(args.stack_format.as_deref(), args.stack_count)
+                .map_err(|error| McpError::invalid_params(error, None))?,
+            format!("u rip L{}", clamp_count(args.disassemble_count, 16, 512)),
+            format!("dq rsp L{}", clamp_count(args.stack_memory_count, 32, 1024)),
+            "bl".to_string(),
+        ];
+
+        for memory in args.memory.unwrap_or_default() {
+            commands.push(
+                memory_command(&memory.address, memory.format.as_deref(), memory.count)
+                    .map_err(|error| McpError::invalid_params(error, None))?,
+            );
+        }
+
+        let mut steps = Vec::new();
+        for command in commands {
+            let (step, _) = self
+                .diagnostic_command_step(args.session_id.as_deref(), &command)
+                .await;
+            steps.push(step);
+        }
+
+        Ok(json!({ "steps": steps }))
+    }
+
+    async fn continue_until_break(&self, args: ContinueUntilBreakArgs) -> Result<Value, McpError> {
+        let timeout_secs = args.timeout_secs.unwrap_or(30).clamp(1, 3600);
+        let poll_interval =
+            Duration::from_millis(args.poll_interval_millis.unwrap_or(250).clamp(50, 10_000));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let resumed = self.resume_target(args.session_id.as_deref()).await?;
+
+        loop {
+            let state_payload = self.query_state(args.session_id.as_deref()).await?;
+            if state_payload["state"]["ready_for_commands"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                return Ok(json!({
+                    "resumed": resumed,
+                    "final_state": state_payload["state"],
+                    "timed_out": false,
+                }));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(json!({
+                    "resumed": resumed,
+                    "final_state": state_payload["state"],
+                    "timed_out": true,
+                }));
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    async fn evaluate_expression(&self, args: EvaluateExpressionArgs) -> Result<Value, McpError> {
+        let expression = args.expression.trim();
+        if expression.is_empty() {
+            return Err(McpError::invalid_params("expression cannot be empty", None));
+        }
+
+        let evaluator = args
+            .evaluator
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("masm")
+            .to_ascii_lowercase();
+        let command = match evaluator.as_str() {
+            "masm" | "?" => format!("? {expression}"),
+            "cpp" | "c++" | "??" => format!("?? {expression}"),
+            _ => {
+                return Err(McpError::invalid_params(
+                    "evaluator must be `masm` or `cpp`",
+                    None,
+                ));
+            }
+        };
+
+        self.execute_command(args.session_id.as_deref(), command)
+            .await
+    }
+
+    async fn list_modules(&self, args: ListModulesArgs) -> Result<Value, McpError> {
+        let mut command = String::from("lm");
+        if args.unloaded.unwrap_or(false) {
+            command.push('u');
+        }
+        if args.verbose.unwrap_or(false) {
+            command.push('v');
+        }
+        if let Some(pattern) = trimmed_nonempty(args.pattern.as_deref()) {
+            command.push_str(" m ");
+            command.push_str(pattern);
+        }
+
+        self.execute_command(args.session_id.as_deref(), command)
+            .await
+    }
+
+    async fn search_symbols(&self, args: SearchSymbolsArgs) -> Result<Value, McpError> {
+        let pattern = args.pattern.trim();
+        if pattern.is_empty() {
+            return Err(McpError::invalid_params("pattern cannot be empty", None));
+        }
+
+        self.execute_command(args.session_id.as_deref(), format!("x {pattern}"))
+            .await
+    }
+
+    async fn inspect_driver(&self, args: InspectDriverArgs) -> Result<Value, McpError> {
+        let name = args.name.trim();
+        if name.is_empty() {
+            return Err(McpError::invalid_params(
+                "driver name cannot be empty",
+                None,
+            ));
+        }
+        let flags = trimmed_nonempty(args.flags.as_deref()).unwrap_or("7");
+
+        self.execute_command(
+            args.session_id.as_deref(),
+            format!("!drvobj {name} {flags}"),
+        )
+        .await
+    }
+
     async fn query_state(&self, session_id: Option<&str>) -> Result<Value, McpError> {
         let state = match &self.backend {
             ServerBackend::AttachedSession { dispatcher } => dispatcher
@@ -835,7 +1422,7 @@ impl WindbgMcpServer {
 impl ServerHandler for WindbgMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.is_headless() {
-            "Open a session with `windbg_open_session` before using debugger actions. Then call `windbg_search_catalog`, read `windbg://command/{id}`, call `windbg_get_execution_state`, interrupt if needed, and only then call `windbg_execute_command`. Use `windbg_get_output` with the returned cursor to fetch buffered command output incrementally. Use `windbg_resume_target` to continue a live target without blocking on a raw `g` command. Use `windbg_recover_session` if a live KDNET target may have been left broken or you need a bounded break-in recovery action. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
+            "Open a session with `windbg_open_session` before using debugger actions. Use `windbg_set_breakpoint`, `windbg_continue_until_break`, `windbg_breakpoint_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common reverse-engineering flows. Use `windbg_execute_command` for raw WinDbg commands, `windbg_get_output` with cursors for buffered output, and `windbg_resume_target` to continue a live target without blocking on raw `g`. Use `windbg_recover_session` if a live KDNET target may have been left broken. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
         } else {
             "This server is organized around low-context resources plus a small toolset. Start with `windbg_search_catalog`, read `windbg://command/{id}`, optionally escalate to `windbg://command-full/{id}`, then call `windbg_get_execution_state`. If the debugger is running or busy, call `windbg_interrupt_target` and verify state again before calling `windbg_execute_command`. Use `windbg_get_output` to read buffered command output again later, and `windbg_resume_target` to continue execution without issuing a raw `g` command."
         };
@@ -871,6 +1458,20 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_get_output" => Some(self.output_tool()),
             "windbg_prepare_symbols" => Some(self.prepare_symbols_tool()),
             "windbg_diagnose_extensions" => Some(self.diagnose_extensions_tool()),
+            "windbg_set_breakpoint" => Some(self.set_breakpoint_tool()),
+            "windbg_list_breakpoints" => Some(self.list_breakpoints_tool()),
+            "windbg_clear_breakpoint" => Some(self.clear_breakpoint_tool()),
+            "windbg_read_registers" => Some(self.read_registers_tool()),
+            "windbg_write_register" => Some(self.write_register_tool()),
+            "windbg_read_memory" => Some(self.read_memory_tool()),
+            "windbg_disassemble" => Some(self.disassemble_tool()),
+            "windbg_backtrace" => Some(self.backtrace_tool()),
+            "windbg_breakpoint_snapshot" => Some(self.breakpoint_snapshot_tool()),
+            "windbg_continue_until_break" => Some(self.continue_until_break_tool()),
+            "windbg_evaluate_expression" => Some(self.evaluate_expression_tool()),
+            "windbg_list_modules" => Some(self.list_modules_tool()),
+            "windbg_search_symbols" => Some(self.search_symbols_tool()),
+            "windbg_inspect_driver" => Some(self.inspect_driver_tool()),
             "windbg_search_catalog" => Some(self.search_tool()),
             "windbg_interrupt_target" => Some(self.interrupt_tool()),
             "windbg_resume_target" => Some(self.resume_tool()),
@@ -917,6 +1518,76 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_diagnose_extensions" => {
                 let args: DiagnoseExtensionsArgs = self.parse_arguments(request.arguments)?;
                 let payload = self.diagnose_extensions(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_set_breakpoint" => {
+                let args: SetBreakpointArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.set_breakpoint(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_list_breakpoints" => {
+                let args: ListBreakpointsArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.list_breakpoints(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_clear_breakpoint" => {
+                let args: ClearBreakpointArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.clear_breakpoint(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_read_registers" => {
+                let args: ReadRegistersArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.read_registers(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_write_register" => {
+                let args: WriteRegisterArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.write_register(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_read_memory" => {
+                let args: ReadMemoryArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.read_memory(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_disassemble" => {
+                let args: DisassembleArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.disassemble(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_backtrace" => {
+                let args: BacktraceArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.backtrace(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_breakpoint_snapshot" => {
+                let args: BreakpointSnapshotArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.breakpoint_snapshot(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_continue_until_break" => {
+                let args: ContinueUntilBreakArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.continue_until_break(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_evaluate_expression" => {
+                let args: EvaluateExpressionArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.evaluate_expression(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_list_modules" => {
+                let args: ListModulesArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.list_modules(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_search_symbols" => {
+                let args: SearchSymbolsArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.search_symbols(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_inspect_driver" => {
+                let args: InspectDriverArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.inspect_driver(args).await?;
                 Ok(CallToolResult::structured(payload))
             }
             "windbg_search_catalog" => {
@@ -1230,6 +1901,73 @@ mod tests {
             .get_tool("windbg_diagnose_extensions")
             .expect("diagnose extensions tool should be listed for headless mode");
         assert_eq!(tool.name, "windbg_diagnose_extensions");
+    }
+
+    #[test]
+    fn reverse_engineering_tools_are_exposed_in_headless_mode() {
+        let server = WindbgMcpServer::headless(HeadlessSessionManager::new());
+
+        for name in [
+            "windbg_set_breakpoint",
+            "windbg_list_breakpoints",
+            "windbg_clear_breakpoint",
+            "windbg_read_registers",
+            "windbg_write_register",
+            "windbg_read_memory",
+            "windbg_disassemble",
+            "windbg_backtrace",
+            "windbg_breakpoint_snapshot",
+            "windbg_continue_until_break",
+            "windbg_evaluate_expression",
+            "windbg_list_modules",
+            "windbg_search_symbols",
+            "windbg_inspect_driver",
+        ] {
+            let tool = server
+                .get_tool(name)
+                .unwrap_or_else(|| panic!("{name} should be listed for headless mode"));
+            assert_eq!(tool.name, name);
+        }
+    }
+
+    #[test]
+    fn memory_command_formats_common_reverse_engineering_reads() {
+        assert_eq!(
+            memory_command("rsp", Some("qwords"), Some(4)).expect("qwords format"),
+            "dq rsp L4"
+        );
+        assert_eq!(
+            memory_command("poi(rcx)", Some("bytes"), Some(16)).expect("bytes format"),
+            "db poi(rcx) L16"
+        );
+        assert_eq!(
+            memory_command("rcx", Some("poi"), Some(2)).expect("poi format"),
+            "dq poi(rcx) L2"
+        );
+    }
+
+    #[test]
+    fn backtrace_command_preserves_case_sensitive_stack_formats() {
+        assert_eq!(
+            backtrace_command(Some("kP"), Some(12)).expect("kP format"),
+            "kP 12"
+        );
+        assert_eq!(
+            backtrace_command(Some("KP"), Some(12)).expect("case-insensitive kp format"),
+            "kp 12"
+        );
+    }
+
+    #[test]
+    fn breakpoint_command_string_preserves_kernel_paths() {
+        assert_eq!(
+            quote_debugger_command(r#"!drvobj \Driver\ShadowGate 7; g"#),
+            r#""!drvobj \Driver\ShadowGate 7; g""#
+        );
+        assert_eq!(
+            quote_debugger_command(r#".printf "hit"; g"#),
+            r#"".printf \"hit\"; g""#
+        );
     }
 
     #[test]

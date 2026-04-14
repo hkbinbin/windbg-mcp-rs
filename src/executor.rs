@@ -55,7 +55,6 @@ pub enum ExecutionError {
 }
 
 pub enum ExecutionMode {
-    CurrentSession,
     KernelConnection {
         connect_options: String,
         startup_command: Option<String>,
@@ -518,42 +517,6 @@ fn handle_request(
     }
 }
 
-pub fn query_current_session_state() -> Result<DebuggerExecutionState, ExecutionError> {
-    #[cfg(windows)]
-    {
-        let mut executor = DbgEngExecutor::connect_session()?;
-        executor.query_execution_state()
-    }
-    #[cfg(not(windows))]
-    {
-        Err(ExecutionError::WindowsOnly)
-    }
-}
-
-pub fn interrupt_current_session() -> Result<DebuggerExecutionState, ExecutionError> {
-    #[cfg(windows)]
-    {
-        let mut executor = DbgEngExecutor::connect_session()?;
-        executor.interrupt_target()
-    }
-    #[cfg(not(windows))]
-    {
-        Err(ExecutionError::WindowsOnly)
-    }
-}
-
-pub fn resume_current_session() -> Result<DebuggerExecutionState, ExecutionError> {
-    #[cfg(windows)]
-    {
-        let mut executor = DbgEngExecutor::connect_session()?;
-        executor.resume_target()
-    }
-    #[cfg(not(windows))]
-    {
-        Err(ExecutionError::WindowsOnly)
-    }
-}
-
 pub fn default_attach_timeout() -> Duration {
     DEFAULT_ATTACH_TIMEOUT
 }
@@ -642,16 +605,6 @@ fn build_executor(mode: ExecutionMode) -> Result<Box<dyn BlockingExecutor>, Exec
             responses,
             state: DebuggerExecutionState::break_state(),
         })),
-        ExecutionMode::CurrentSession => {
-            #[cfg(windows)]
-            {
-                Ok(Box::new(DbgEngExecutor::connect_session()?))
-            }
-            #[cfg(not(windows))]
-            {
-                Err(ExecutionError::WindowsOnly)
-            }
-        }
         ExecutionMode::KernelConnection {
             connect_options,
             startup_command,
@@ -1984,43 +1937,6 @@ mod windows_impl {
                     }
                 }
             }
-        }
-
-        pub(crate) fn from_existing_client(client: IDebugClient) -> Result<Self, ExecutionError> {
-            let control = client
-                .cast::<IDebugControl>()
-                .map_err(|error| ExecutionError::Startup(error.to_string()))?;
-            let last_known_state = current_state(&control)?;
-            Ok(Self {
-                client,
-                control,
-                last_known_state,
-                pending_startup_command: None,
-                kernel_host: None,
-            })
-        }
-
-        pub(crate) fn execute_command(
-            &mut self,
-            command: &str,
-        ) -> Result<super::CommandExecutionResult, ExecutionError> {
-            <Self as BlockingExecutor>::execute(self, command)
-        }
-
-        pub(crate) fn interrupt_target(
-            &mut self,
-        ) -> Result<DebuggerExecutionState, ExecutionError> {
-            <Self as BlockingExecutor>::interrupt(self)
-        }
-
-        pub(crate) fn resume_target(&mut self) -> Result<DebuggerExecutionState, ExecutionError> {
-            <Self as BlockingExecutor>::resume(self)
-        }
-
-        pub(crate) fn query_execution_state(
-            &mut self,
-        ) -> Result<DebuggerExecutionState, ExecutionError> {
-            <Self as BlockingExecutor>::query_state(self)
         }
 
         fn control(&self) -> IDebugControl {

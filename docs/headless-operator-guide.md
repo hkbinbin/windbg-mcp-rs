@@ -1,6 +1,6 @@
 # Headless KDNET Operator Guide
 
-This guide describes the safe rhythm for stdio MCP clients that own a live KDNET session.
+This guide describes the safe rhythm for stdio MCP clients that own a live KDNET session. The server is headless-only: it runs as an ordinary process, owns dbgeng sessions directly, and does not require a WinDbg GUI or in-process extension DLL.
 
 ## Core Rhythm
 
@@ -10,7 +10,7 @@ This guide describes the safe rhythm for stdio MCP clients that own a live KDNET
 4. If the state is `break`, run short inspection commands or call `windbg_resume_target`.
 5. Perform guest-side work while the target is running.
 6. Call `windbg_interrupt_target` only when debugger inspection is needed.
-7. Run `windbg_execute_command`, `windbg_get_output`, `windbg_prepare_symbols`, or extension diagnostics while the target is broken.
+7. Run focused MCP tools while the target is broken: `windbg_breakpoint_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, `windbg_inspect_driver`, `windbg_execute_command`, `windbg_get_output`, `windbg_prepare_symbols`, or extension diagnostics.
 8. Call `windbg_resume_target` as soon as the inspection is complete.
 9. Call `windbg_close_session` for cleanup; it resumes a broken kernel target before detach by default.
 
@@ -33,6 +33,27 @@ windbg_resume_target
 ```
 
 If extension loading still fails, call `windbg_diagnose_extensions` to collect `.extpath`, `.chain`, symbol status, the load attempt, the probe command, and remediation hints.
+
+## Reverse Engineering Tools
+
+Prefer the higher-level MCP wrappers for common breakpoint-hit work instead of manually stitching raw command strings together:
+
+```text
+windbg_set_breakpoint {"location":"nt!DbgBreakPointWithStatus","one_shot":true}
+windbg_continue_until_break {"timeout_secs":30}
+windbg_breakpoint_snapshot
+windbg_read_registers {"registers":["rip","rsp","rcx","rdx"]}
+windbg_read_memory {"address":"rsp","format":"qwords","count":16}
+windbg_disassemble {"address":"rip","count":16}
+windbg_backtrace {"format":"kv","count":32}
+windbg_evaluate_expression {"expression":"poi(rsp)"}
+windbg_list_modules {"pattern":"ShadowGate*","verbose":true}
+windbg_search_symbols {"pattern":"nt!*CreateFile*"}
+windbg_inspect_driver {"name":"ShadowGate","flags":"7"}
+windbg_resume_target
+```
+
+`windbg_set_breakpoint` wraps `bp`, `bu`, and `bm`, including one-shot breakpoints, pass counts, and a WinDbg command string. It is still a debugger-level breakpoint wrapper, not an automatic process-name filter; for noisy global kernel breakpoints, use explicit WinDbg conditions/commands or keep the TODO item for process-targeted helpers open.
 
 ## Driver Load Breakpoints
 

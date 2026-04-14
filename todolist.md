@@ -27,17 +27,20 @@
 
 ## P0 Dynamic Debugging Usability
 
+- [x] Add high-level reverse-engineering MCP wrappers for common breakpoint-hit work.
+  Added `windbg_set_breakpoint`, `windbg_list_breakpoints`, `windbg_clear_breakpoint`, `windbg_continue_until_break`, `windbg_read_registers`, `windbg_write_register`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_breakpoint_snapshot`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver`. Live smoke validation covered breakpoint setup/list/clear, register reads, stack memory reads, disassembly, backtrace, and snapshot collection.
+
 - [ ] Make `NtCreateFile` / `NtDeviceIoControlFile` breakpoint workflows stable in headless mode.
-  Current breakpoints can be set and hit, but global syscall noise plus transient `0x80040205` command errors make targeted tracing unreliable.
+  Current breakpoint primitives and snapshot tools work, but global syscall noise plus transient dbgeng command-window states can still make targeted tracing unreliable without process-aware filtering.
 
 - [ ] Add process-targeted breakpoint support for live kernel sessions.
-  Preferred outcome: support a clean workflow equivalent to process-scoped breakpoints so `maze_probe.exe`/`ShadowGateApp.exe` can be traced without unrelated system hits.
+  Preferred outcome: support a clean workflow equivalent to process-scoped breakpoints so `maze_probe.exe`/`ShadowGateApp.exe` can be traced without unrelated system hits. `windbg_set_breakpoint` supports raw WinDbg command strings, but does not yet synthesize process-name guards automatically.
 
 - [x] Verify core command execution immediately after ShadowGate load breakpoint hits.
   Verified `break -> .lastevent/lm/lmv/~/r/k/bl -> recover_session -> service RUNNING`, including the `~` fallback path.
 
 - [ ] Broaden breakpoint-hit stability testing beyond ShadowGate load events.
-  We still need repeatable syscall breakpoint workflows such as `NtCreateFile` / `NtDeviceIoControlFile` without unrelated system noise.
+  Basic reverse-engineering tools were live-tested on a safe kernel breakpoint; we still need repeatable syscall breakpoint workflows such as `NtCreateFile` / `NtDeviceIoControlFile` without unrelated system noise.
 
 - [x] Add a thread-list fallback for `~` when dbgeng reports transient `0x80040205`.
   The fallback uses `IDebugSystemObjects` to return current/event thread ids instead of failing outright.
@@ -114,3 +117,6 @@
   Include the exact call rhythm:
   `open_session -> wait break -> resume -> guest action -> interrupt -> execute_command/get_output -> resume`
   Added `docs/headless-operator-guide.md`.
+
+- [x] Remove legacy GUI/plugin-facing project surface.
+  Removed the WinDbg extension DLL entrypoints, in-process plugin server, cdylib build target, and README/plugin screenshot workflow. The maintained binary is now `windbg_mcp_headless`.
