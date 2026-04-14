@@ -291,6 +291,77 @@ Post-call length:
 out_len = 0x17
 ```
 
+## Dynamic XOR String Capture
+
+The final string was re-captured dynamically through MCP breakpoints inside the obfuscated transform, not by replaying the old static helper scripts. A temporary guest P/Invoke trigger only generated real `DeviceIoControl` traffic; all string evidence below came from the kernel debugger session.
+
+Useful breakpoints for the validated build:
+
+```text
+final transform call = base+0x3176ef
+transform entry      = base+0x3f7c6d
+xmm source load      = base+0x2d69b2
+xmm output store     = base+0x2d6b53
+after xmm store      = base+0x2d6b5c
+tail pointer setup   = base+0x2d6c1f
+tail dword store     = base+0x2d6c49
+```
+
+At `base+0x3176ef`, the transform call received the canonical path as `RCX`:
+
+```text
+RRRRRRDDRRRRUURRDDDDDDDDLLDDDDRR
+```
+
+At `base+0x2d69b2`, the transform executed:
+
+```text
+movups xmm0, xmmword ptr ss:[r9+rdi]
+```
+
+The source memory at `[r9+rdi]` was:
+
+```text
+66 6c 61 67 7b 53 48 41 44 30 57 4e 54 5f 48 59
+50 45 52 56 4d 58 7d 09 09 09 09 09 09 09 09 09
+```
+
+ASCII interpretation:
+
+```text
+flag{SHAD0WNT_HYPERVMX}\x09\x09\x09\x09\x09\x09\x09\x09\x09
+```
+
+So the concrete runtime XOR/decrypted string value is:
+
+```text
+flag{SHAD0WNT_HYPERVMX}
+```
+
+At `base+0x2d6b53`, the first 16 bytes were stored into the output buffer with:
+
+```text
+movups xmmword ptr [r9+rcx-6004CC23h], xmm0
+```
+
+Immediately after the store, the output buffer contained:
+
+```text
+66 6c 61 67 7b 53 48 41 44 30 57 4e 54 5f 48 59
+flag{SHAD0WNT_HY
+```
+
+The tail was then assembled through an obfuscated pointer/data pair. At `base+0x2d6c1f`, stack scratch data contained a pointer to `output+0x10` followed by the little-endian dword bytes for `PERV`. At `base+0x2d6c49`, `EDX=0x56524550` was written through `R10`, producing:
+
+```text
+50 45 52 56
+PERV
+```
+
+The remaining `MX}` tail and `out_len=0x17` were confirmed from the final `DeviceIoControl` output buffer. This matches the 23-byte flag string above.
+
+Hardware write breakpoints on predicted stack addresses were attempted as an upstream XOR trace, but they hit kernel stack reuse paths such as `nt!HalPerformEndOfInterrupt`, `nt!KiBeginThreadAccountingPeriod`, and `nt!KiDispatchInterrupt`. For this driver, code breakpoints at the transform materialization instructions are much cleaner and more reliable than broad stack data watchpoints.
+
 A mutation test changed the first source byte from `R` to `A` at the transform breakpoint. The transform returned `out_len=0` and left `SystemBuffer+0x40` zeroed. This confirms the final transform is path-gated: the 32-byte canonical path is the key material/validator for releasing the secret.
 
 Behavior-equivalent pseudocode:

@@ -230,6 +230,7 @@ all debugger-side observation. That run confirmed:
 - The decoded IO stack arguments were `00000084 0000000c 0x80012004 00000000`.
 - The SystemBuffer began with `52 00 00 00 00 00 00 00 65 13 ad de`, matching the encoded `W` MOVE packet.
 - After `windbg_resume_target` and `windbg_close_session`, the guest was reachable over SSH again.
+- A deeper dynamic run set code breakpoints in the ShadowGate final transform and captured the runtime materialized string block from debugger-side memory reads. The concrete string was `flag{SHAD0WNT_HYPERVMX}`, with the first 16 bytes observed at the XMM source load and output store instructions. See `docs/shadowgate-crypto-reversing.md` for the exact RVAs and memory dumps.
 
 The hardened auto-detection path was then live-validated at the same ShadowGate
 MOVE breakpoint by calling `windbg_ioctl_snapshot {"buffer_count":132}` without
@@ -258,6 +259,7 @@ IRP, and memory evidence through MCP tools.
 - `lm m <driver>*` may be empty for some drivers even when `!drvobj <driver> 7` resolves the object. Treat `!drvobj` as the stronger signal for ShadowGate-style workflows.
 - `windbg_driver_dispatch_snapshot` assumes the breakpoint is at or near a normal x64 dispatch routine entry. If the breakpoint is deeper in the handler, pass explicit IRP and object expressions.
 - `windbg_ioctl_snapshot` collects generic buffered-IOCTL context, but protocol-specific decoding is still left to the caller. For example, ShadowGate's move packet fields are documented separately in `docs/shadowgate-crypto-reversing.md`.
+- Hardware data breakpoints on kernel stack scratch addresses can be noisy because interrupts and scheduler paths reuse the same stack region. Prefer precise code breakpoints around known transform/load/store instructions when tracing obfuscated driver output materialization.
 
 ## Maintenance Checklist
 

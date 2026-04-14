@@ -11,7 +11,72 @@
 - Use the server from any MCP client over stdio by default, or Streamable HTTP when `--listen` is passed
 - Use higher-level reverse-engineering MCP tools for breakpoints, registers, memory, disassembly, backtraces, expressions, modules, symbols, and driver objects
 
-## Quick Start
+## Setup
+
+The recommended setup is to run `windbg_mcp_headless.exe` as a normal stdio MCP server and open debugger sessions on demand with `windbg_open_session`. This keeps KDNET keys and VM-specific connection strings out of the global MCP server configuration.
+
+### Prerequisites
+
+- Windows host with Microsoft Debugging Tools / WinDbg Preview installed.
+- Rust toolchain with Cargo available on `PATH`.
+- A writable symbol cache directory, for example `C:\Symbols`.
+- For kernel debugging, a target VM configured for KDNET and waiting for the debugger.
+- An MCP client that supports stdio servers.
+
+### Build The Server
+
+Build the maintained headless binary:
+
+```powershell
+cargo build --release --bin windbg_mcp_headless
+```
+
+The resulting server binary is:
+
+```text
+target\release\windbg_mcp_headless.exe
+```
+
+You can smoke-test the server from the repository root:
+
+```powershell
+python tools\headless_mcp_smoke.py
+```
+
+### Configure A Stdio MCP Client
+
+Point your MCP client at the release binary. A generic MCP JSON-style configuration looks like:
+
+```json
+{
+  "mcpServers": {
+    "windbg_mcp_headless": {
+      "command": "C:\\path\\to\\windbg-mcp-rs\\target\\release\\windbg_mcp_headless.exe",
+      "args": []
+    }
+  }
+}
+```
+
+For Codex, add or replace the WinDbg MCP entry in the global config file:
+
+```text
+%USERPROFILE%\.codex\config.toml
+```
+
+Example Codex TOML:
+
+```toml
+[mcp_servers.windbg_mcp_headless]
+command = 'C:\path\to\windbg-mcp-rs\target\release\windbg_mcp_headless.exe'
+args = []
+```
+
+If your client supports tool timeouts, set them generously. Some live KDNET commands, symbol downloads, and extension-backed commands can take tens of seconds.
+
+Avoid putting `--connect-kernel` and a KDNET key directly into the global MCP config unless you intentionally want every client startup to attach to the same VM. Prefer opening the session through MCP tool calls.
+
+### Run Manually During Development
 
 Start the default stdio MCP server:
 
@@ -19,13 +84,13 @@ Start the default stdio MCP server:
 cargo run --bin windbg_mcp_headless --
 ```
 
-Optionally start an HTTP MCP server:
+Optionally start a Streamable HTTP MCP server instead of stdio:
 
 ```powershell
 cargo run --bin windbg_mcp_headless -- --listen 127.0.0.1:50051
 ```
 
-Start headless mode and immediately attach to a KDNET target:
+For one-off HTTP or debugging experiments, the server can also open an initial KDNET session at startup:
 
 ```powershell
 cargo run --bin windbg_mcp_headless -- `
@@ -34,11 +99,104 @@ cargo run --bin windbg_mcp_headless -- `
   --session-id kdnet-main
 ```
 
-The `--connect-kernel` value accepts either raw `-k` options such as `net:port=...,key=...` or a full launcher string such as:
+The connection value accepts either raw WinDbg `-k` options:
 
 ```text
-windbgx -k net:port=50000,key=...
+net:port=50000,key=<your-kdnet-key>
 ```
+
+or a full launcher-style string:
+
+```text
+windbgx -k net:port=50000,key=<your-kdnet-key>
+```
+
+### Open A KDNET Session From MCP
+
+From the MCP client, call:
+
+```json
+{
+  "connection": "net:port=50000,key=<your-kdnet-key>",
+  "session_id": "kdnet-main",
+  "startup_command": ".sympath SRV*C:\\Symbols*https://msdl.microsoft.com/download/symbols",
+  "attach_timeout_secs": 90
+}
+```
+
+with tool:
+
+```text
+windbg_open_session
+```
+
+Then poll:
+
+```text
+windbg_get_execution_state
+```
+
+Expected early states:
+
+- `no_debuggee`: dbgeng is waiting for the target to reconnect. Wait and poll again.
+- `break`: the VM kernel is paused and debugger commands are accepted.
+- `go`: the VM is running. Use `windbg_interrupt_target` before inspection.
+
+If the session opens in `break`, inspect briefly or call:
+
+```text
+windbg_resume_target
+```
+
+For raw command output, use:
+
+```text
+windbg_execute_command
+windbg_get_output
+```
+
+`windbg_get_output` supports cursors so clients can read only newly buffered output after each command.
+
+### Minimal Kernel Driver Workflow
+
+A typical kernel-driver debugging loop is:
+
+```text
+windbg_open_session {"connection":"net:port=50000,key=<your-kdnet-key>","session_id":"kdnet-main","attach_timeout_secs":90}
+windbg_get_execution_state
+windbg_resume_target
+```
+
+Start or trigger the driver from the guest while the VM is running, then break only when debugger inspection is needed:
+
+```text
+windbg_interrupt_target
+windbg_prepare_symbols {"module":"nt"}
+windbg_execute_command ".load kdexts"
+windbg_driver_summary {"name":"ShadowGate","device":"\\Device\\ShadowGate"}
+windbg_set_driver_dispatch_breakpoints {"driver":"ShadowGate","functions":["IRP_MJ_DEVICE_CONTROL"]}
+windbg_resume_target
+```
+
+After the guest triggers an IOCTL and the breakpoint hits:
+
+```text
+windbg_continue_until_break {"timeout_secs":60}
+windbg_ioctl_snapshot {"buffer_count":132}
+windbg_read_registers
+windbg_read_memory {"address":"@rsp","format":"qwords","count":32}
+windbg_disassemble {"address":"@rip","count":16}
+windbg_backtrace {"format":"kv","count":32}
+windbg_resume_target
+```
+
+Always resume or close cleanly when finished:
+
+```text
+windbg_close_session {"session_id":"kdnet-main"}
+```
+
+`windbg_close_session` resumes a broken kernel target before detach by default so the VM is not left paused.
 
 ## Headless Session Tools
 
