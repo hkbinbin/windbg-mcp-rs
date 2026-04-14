@@ -25,6 +25,9 @@
 - [x] Add an end-to-end recovery validation that confirms guest SSH is back after `windbg_recover_session`.
   Verified after VM reboot and after ShadowGate load-break regression: `recover_session` resumed the target to `go`, and TCP/22 became reachable again.
 
+- [x] Clean up failed `windbg_open_session` attempts so stale KDNET hosts cannot steal a later VM reconnect.
+  If the kernel host attaches the KDNET transport but the command client cannot connect before `attach_timeout_secs`, `attach_kernel` now explicitly stops that host before returning the error. `KernelSessionHost` also requests stop from `Drop`, covering future early-return paths that would otherwise leave an unregistered host alive.
+
 ## P0 Dynamic Debugging Usability
 
 - [x] Add high-level reverse-engineering MCP wrappers for common breakpoint-hit work.

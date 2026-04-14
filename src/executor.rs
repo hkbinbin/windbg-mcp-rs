@@ -1237,6 +1237,12 @@ mod windows_impl {
         }
     }
 
+    impl Drop for KernelSessionHost {
+        fn drop(&mut self) {
+            self.request_stop();
+        }
+    }
+
     #[implement(IDebugOutputCallbacks)]
     struct OutputCollector {
         buffer: Arc<Mutex<String>>,
@@ -1931,6 +1937,10 @@ mod windows_impl {
                     }
                     Err(error) => {
                         if Instant::now() >= connect_deadline {
+                            // The host owns the KDNET transport as soon as AttachKernelWide
+                            // succeeds. If the command client never connects, do not leave an
+                            // unregistered host waiting for a later VM reconnect.
+                            host.request_stop();
                             return Err(error);
                         }
                         thread::sleep(POLL_INTERVAL);
