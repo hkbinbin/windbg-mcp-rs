@@ -40,6 +40,8 @@ Prefer the higher-level MCP wrappers for common breakpoint-hit work instead of m
 
 ```text
 windbg_set_breakpoint {"location":"nt!DbgBreakPointWithStatus","one_shot":true}
+windbg_find_process {"name":"ShadowGateApp.exe"}
+windbg_set_syscall_breakpoint {"process_name":"ShadowGateApp.exe","syscall":"NtDeviceIoControlFile"}
 windbg_continue_until_break {"timeout_secs":30}
 windbg_breakpoint_snapshot
 windbg_read_registers {"registers":["rip","rsp","rcx","rdx"]}
@@ -53,7 +55,7 @@ windbg_inspect_driver {"name":"ShadowGate","flags":"7"}
 windbg_resume_target
 ```
 
-`windbg_set_breakpoint` wraps `bp`, `bu`, and `bm`, including one-shot breakpoints, pass counts, and a WinDbg command string. It is still a debugger-level breakpoint wrapper, not an automatic process-name filter; for noisy global kernel breakpoints, use explicit WinDbg conditions/commands or keep the TODO item for process-targeted helpers open.
+`windbg_set_breakpoint` wraps `bp`, `bu`, and `bm`, including one-shot breakpoints, pass counts, and a WinDbg command string. For noisy global kernel breakpoints, prefer `windbg_set_process_breakpoint` or `windbg_set_syscall_breakpoint`; they resolve the target process with `!process`, prepare `nt` symbols on demand, and set WinDbg's native `bp /p <EPROCESS>` breakpoint.
 
 ## Driver Load Breakpoints
 

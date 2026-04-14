@@ -64,6 +64,9 @@ Live-target control is split into explicit tools:
 Reverse-engineering convenience tools:
 
 - `windbg_set_breakpoint`
+- `windbg_find_process`
+- `windbg_set_process_breakpoint`
+- `windbg_set_syscall_breakpoint`
 - `windbg_list_breakpoints`
 - `windbg_clear_breakpoint`
 - `windbg_continue_until_break`
@@ -115,7 +118,7 @@ Pure UI shortcut topics remain available as documentation, and command execution
 
 Recommended agent flow in headless mode: call `windbg_open_session`, optionally `windbg_switch_session`, then follow the same command flow. If extension commands need kernel symbols, call `windbg_prepare_symbols` while broken into the target, and use `windbg_diagnose_extensions` when `.load kdexts` or `!process` is not behaving as expected. If the debugger is running or busy, call `windbg_interrupt_target` explicitly and verify state again before executing the command. Use `windbg_resume_target` to continue execution without issuing a raw `g` command. Use `windbg_get_output` with the returned `next_cursor` to fetch only newly buffered command output.
 
-Recommended breakpoint flow: call `windbg_set_breakpoint`, call `windbg_continue_until_break`, then call `windbg_breakpoint_snapshot` or targeted tools such as `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, and `windbg_backtrace`. Use `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common symbol/module/driver-object checks. `windbg_set_breakpoint` wraps `bp`, `bu`, and `bm`; it supports one-shot breakpoints, pass counts, and command strings, but it does not yet provide automatic process-name filtering for noisy global kernel breakpoints.
+Recommended breakpoint flow: call `windbg_set_breakpoint`, call `windbg_continue_until_break`, then call `windbg_breakpoint_snapshot` or targeted tools such as `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, and `windbg_backtrace`. For noisy kernel syscalls, call `windbg_find_process` and then `windbg_set_process_breakpoint` or `windbg_set_syscall_breakpoint`; these use WinDbg's native kernel `bp /p <EPROCESS>` support so `NtCreateFile` / `NtDeviceIoControlFile` tracing can be scoped to `ShadowGateApp.exe`, `maze_probe.exe`, or a specific PID. Use `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common symbol/module/driver-object checks.
 
 ## Development
 
@@ -146,6 +149,7 @@ Additional tracked validation helpers:
 - `tools/headless_extension_smoke.py`: prepares symbols, loads `kdexts`, and runs extension-backed probes.
 - `tools/headless_get_output_check.py`: verifies cursor-based `windbg_get_output` reads.
 - `tools/headless_kdnet_soak.py`: repeats `interrupt -> execute -> resume` cycles and can probe guest TCP reachability.
+- `tools/headless_syscall_breakpoint_smoke.py`: validates process-scoped syscall breakpoint setup and can optionally launch a trigger command.
 - `tools/shadowgate_smoke.py`: drives ShadowGate service/load-break inspections when guest SSH is available.
 
 For day-to-day operating guidance, see `docs/headless-operator-guide.md`. For output cursor regression coverage, see `docs/get-output-regression-plan.md`.

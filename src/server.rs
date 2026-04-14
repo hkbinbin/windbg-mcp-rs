@@ -4,7 +4,7 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, handler::server::common::schema_for_type,
     model::*, schemars::JsonSchema, service::RequestContext,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
@@ -84,6 +84,43 @@ struct SetBreakpointArgs {
     one_shot: Option<bool>,
     pass_count: Option<u32>,
     command: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FindProcessArgs {
+    session_id: Option<String>,
+    name: Option<String>,
+    pid: Option<String>,
+    prepare_symbols: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetProcessBreakpointArgs {
+    session_id: Option<String>,
+    location: String,
+    process_name: Option<String>,
+    pid: Option<String>,
+    eprocess: Option<String>,
+    ethread: Option<String>,
+    kind: Option<String>,
+    one_shot: Option<bool>,
+    pass_count: Option<u32>,
+    command: Option<String>,
+    prepare_symbols: Option<bool>,
+    match_index: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetSyscallBreakpointArgs {
+    session_id: Option<String>,
+    syscall: String,
+    process_name: Option<String>,
+    pid: Option<String>,
+    eprocess: Option<String>,
+    one_shot: Option<bool>,
+    command: Option<String>,
+    prepare_symbols: Option<bool>,
+    match_index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -213,6 +250,14 @@ struct ListSessionsArgs {}
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct CurrentSessionArgs {}
 
+#[derive(Debug, Clone, Serialize)]
+struct ProcessInfo {
+    eprocess: String,
+    pid: Option<String>,
+    image: Option<String>,
+    summary: String,
+}
+
 #[derive(Clone)]
 enum ServerBackend {
     AttachedSession { dispatcher: CommandDispatcher },
@@ -304,8 +349,73 @@ fn trimmed_nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn debugger_atom(value: &str, field: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{field} cannot be empty"));
+    }
+    if value
+        .chars()
+        .any(|ch| matches!(ch, ';' | '"' | '\r' | '\n'))
+    {
+        return Err(format!(
+            "{field} cannot contain command separators, quotes, or newlines"
+        ));
+    }
+    Ok(value.to_string())
+}
+
 fn clamp_count(value: Option<u32>, default: u32, max: u32) -> u32 {
     value.unwrap_or(default).clamp(1, max)
+}
+
+fn build_breakpoint_command(
+    kind: Option<&str>,
+    location: &str,
+    one_shot: Option<bool>,
+    process: Option<&str>,
+    thread: Option<&str>,
+    pass_count: Option<u32>,
+    command_string: Option<&str>,
+) -> Result<String, String> {
+    let location = location.trim();
+    if location.is_empty() {
+        return Err("breakpoint location cannot be empty".to_string());
+    }
+
+    let kind = kind
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("bp")
+        .to_ascii_lowercase();
+    if !matches!(kind.as_str(), "bp" | "bu" | "bm") {
+        return Err("breakpoint kind must be `bp`, `bu`, or `bm`".to_string());
+    }
+
+    let mut command = kind;
+    if one_shot.unwrap_or(false) {
+        command.push_str(" /1");
+    }
+    if let Some(process) = trimmed_nonempty(process) {
+        command.push_str(" /p ");
+        command.push_str(&debugger_atom(process, "eprocess")?);
+    }
+    if let Some(thread) = trimmed_nonempty(thread) {
+        command.push_str(" /t ");
+        command.push_str(&debugger_atom(thread, "ethread")?);
+    }
+    command.push(' ');
+    command.push_str(location);
+    if let Some(pass_count) = pass_count {
+        command.push(' ');
+        command.push_str(&pass_count.to_string());
+    }
+    if let Some(command_string) = trimmed_nonempty(command_string) {
+        command.push(' ');
+        command.push_str(&quote_debugger_command(command_string));
+    }
+
+    Ok(command)
 }
 
 fn memory_command(
@@ -359,6 +469,159 @@ fn backtrace_command(format: Option<&str>, count: Option<u32>) -> Result<String,
         }
     };
     Ok(format!("{} {}", command, clamp_count(count, 32, 512)))
+}
+
+fn parse_processes(output: &str) -> Vec<ProcessInfo> {
+    #[derive(Default)]
+    struct Builder {
+        eprocess: String,
+        pid: Option<String>,
+        image: Option<String>,
+        lines: Vec<String>,
+    }
+
+    impl Builder {
+        fn finish(self) -> Option<ProcessInfo> {
+            if self.eprocess.is_empty() {
+                return None;
+            }
+            Some(ProcessInfo {
+                eprocess: self.eprocess,
+                pid: self.pid,
+                image: self.image,
+                summary: self.lines.join("\n"),
+            })
+        }
+    }
+
+    let mut processes = Vec::new();
+    let mut current: Option<Builder> = None;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("PROCESS ") {
+            if let Some(builder) = current.take().and_then(Builder::finish) {
+                processes.push(builder);
+            }
+            let eprocess = rest.split_whitespace().next().unwrap_or("").to_string();
+            current = Some(Builder {
+                eprocess,
+                lines: vec![trimmed.to_string()],
+                ..Builder::default()
+            });
+        } else if let Some(builder) = current.as_mut() {
+            builder.lines.push(line.to_string());
+        }
+
+        if let Some(builder) = current.as_mut() {
+            if let Some(pid) = parse_process_field(trimmed, "Cid:") {
+                builder.pid = Some(pid);
+            }
+            if let Some(image) = parse_process_field(trimmed, "Image:") {
+                builder.image = Some(image);
+            }
+        }
+    }
+
+    if let Some(builder) = current.take().and_then(Builder::finish) {
+        processes.push(builder);
+    }
+
+    processes
+}
+
+fn parse_process_field(line: &str, label: &str) -> Option<String> {
+    let start = line.find(label)? + label.len();
+    line[start..]
+        .split_whitespace()
+        .next()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_output_pid(value: &str) -> Option<u64> {
+    u64::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
+}
+
+fn parse_user_pid(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(decimal) = value.strip_prefix("0n") {
+        return decimal.parse().ok();
+    }
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    value.parse().ok()
+}
+
+fn process_matches(process: &ProcessInfo, name: Option<&str>, pid: Option<&str>) -> bool {
+    if let Some(name) = trimmed_nonempty(name) {
+        let Some(image) = process.image.as_deref() else {
+            return false;
+        };
+        if !wildcard_match_case_insensitive(name, image) {
+            return false;
+        }
+    }
+
+    if let Some(pid) = trimmed_nonempty(pid) {
+        let Some(actual) = process.pid.as_deref().and_then(parse_output_pid) else {
+            return false;
+        };
+        let Some(expected) = parse_user_pid(pid) else {
+            return false;
+        };
+        if actual != expected {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn wildcard_match_case_insensitive(pattern: &str, value: &str) -> bool {
+    fn inner(pattern: &[u8], value: &[u8]) -> bool {
+        match (pattern.split_first(), value.split_first()) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some((&b'*', rest)), _) => {
+                inner(rest, value) || (!value.is_empty() && inner(pattern, &value[1..]))
+            }
+            (Some((&b'?', rest)), Some(_)) => inner(rest, &value[1..]),
+            (Some((&p, rest)), Some((&v, value_rest))) if p == v => inner(rest, value_rest),
+            _ => false,
+        }
+    }
+
+    inner(
+        pattern.to_ascii_lowercase().as_bytes(),
+        value.to_ascii_lowercase().as_bytes(),
+    )
+}
+
+fn normalize_syscall_location(syscall: &str) -> Result<String, String> {
+    let syscall = syscall.trim();
+    if syscall.is_empty() {
+        return Err("syscall cannot be empty".to_string());
+    }
+    if syscall.contains('!') {
+        return Ok(syscall.to_string());
+    }
+
+    let name = match syscall.to_ascii_lowercase().as_str() {
+        "createfile" | "ntcreatefile" => "NtCreateFile",
+        "deviceiocontrol" | "deviceiocontrolfile" | "ntdeviceiocontrolfile" => {
+            "NtDeviceIoControlFile"
+        }
+        _ => syscall,
+    };
+    Ok(format!("nt!{name}"))
 }
 
 fn default_symbol_cache_dir() -> PathBuf {
@@ -482,6 +745,33 @@ impl WindbgMcpServer {
             schema_for_type::<SetBreakpointArgs>(),
         )
         .with_title("Set breakpoint")
+    }
+
+    fn find_process_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_find_process",
+            "Find kernel processes with `!process`, returning parsed EPROCESS, PID, image name, and raw summary blocks. Use this before process-scoped kernel breakpoints.",
+            schema_for_type::<FindProcessArgs>(),
+        )
+        .with_title("Find kernel process")
+    }
+
+    fn set_process_breakpoint_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_set_process_breakpoint",
+            "Resolve a kernel process by image name or PID, then set a process-scoped breakpoint using WinDbg's native `bp /p <EPROCESS>` support.",
+            schema_for_type::<SetProcessBreakpointArgs>(),
+        )
+        .with_title("Set process-scoped breakpoint")
+    }
+
+    fn set_syscall_breakpoint_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_set_syscall_breakpoint",
+            "Set a process-scoped syscall breakpoint for symbols such as `NtCreateFile` or `NtDeviceIoControlFile`, reducing global kernel breakpoint noise.",
+            schema_for_type::<SetSyscallBreakpointArgs>(),
+        )
+        .with_title("Set process-scoped syscall breakpoint")
     }
 
     fn list_breakpoints_tool(&self) -> Tool {
@@ -709,6 +999,9 @@ impl WindbgMcpServer {
             self.prepare_symbols_tool(),
             self.diagnose_extensions_tool(),
             self.set_breakpoint_tool(),
+            self.find_process_tool(),
+            self.set_process_breakpoint_tool(),
+            self.set_syscall_breakpoint_tool(),
             self.list_breakpoints_tool(),
             self.clear_breakpoint_tool(),
             self.read_registers_tool(),
@@ -1037,42 +1330,16 @@ impl WindbgMcpServer {
     }
 
     async fn set_breakpoint(&self, args: SetBreakpointArgs) -> Result<Value, McpError> {
-        let location = args.location.trim();
-        if location.is_empty() {
-            return Err(McpError::invalid_params(
-                "breakpoint location cannot be empty",
-                None,
-            ));
-        }
-
-        let kind = args
-            .kind
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("bp")
-            .to_ascii_lowercase();
-        if !matches!(kind.as_str(), "bp" | "bu" | "bm") {
-            return Err(McpError::invalid_params(
-                "breakpoint kind must be `bp`, `bu`, or `bm`",
-                None,
-            ));
-        }
-
-        let mut command = kind;
-        if args.one_shot.unwrap_or(false) {
-            command.push_str(" /1");
-        }
-        command.push(' ');
-        command.push_str(location);
-        if let Some(pass_count) = args.pass_count {
-            command.push(' ');
-            command.push_str(&pass_count.to_string());
-        }
-        if let Some(command_string) = trimmed_nonempty(args.command.as_deref()) {
-            command.push(' ');
-            command.push_str(&quote_debugger_command(command_string));
-        }
+        let command = build_breakpoint_command(
+            args.kind.as_deref(),
+            &args.location,
+            args.one_shot,
+            None,
+            None,
+            args.pass_count,
+            args.command.as_deref(),
+        )
+        .map_err(|error| McpError::invalid_params(error, None))?;
 
         let set = self
             .execute_debugger_command(args.session_id.as_deref(), command)
@@ -1085,6 +1352,215 @@ impl WindbgMcpServer {
             "breakpoint": render_execution_result(set),
             "breakpoints": render_execution_result(list),
         }))
+    }
+
+    async fn lookup_processes(
+        &self,
+        session_id: Option<&str>,
+        name: Option<&str>,
+        pid: Option<&str>,
+        prepare_symbols: Option<bool>,
+    ) -> Result<(Vec<Value>, Vec<ProcessInfo>), McpError> {
+        if let Some(name) = trimmed_nonempty(name) {
+            debugger_atom(name, "process_name")
+                .map_err(|error| McpError::invalid_params(error, None))?;
+        }
+        if let Some(pid) = trimmed_nonempty(pid) {
+            if parse_user_pid(pid).is_none() {
+                return Err(McpError::invalid_params(
+                    "pid must be decimal, 0n-prefixed decimal, or 0x-prefixed hex",
+                    None,
+                ));
+            }
+        }
+
+        let command = if let Some(name) = trimmed_nonempty(name) {
+            let name = debugger_atom(name, "process_name")
+                .map_err(|error| McpError::invalid_params(error, None))?;
+            format!("!process 0 0 {name}")
+        } else {
+            "!process 0 0".to_string()
+        };
+
+        let mut steps = Vec::new();
+        let (step, output) = self.diagnostic_command_step(session_id, &command).await;
+        steps.push(step);
+        let mut matches = parse_processes(&output)
+            .into_iter()
+            .filter(|process| process_matches(process, name, pid))
+            .collect::<Vec<_>>();
+
+        if (matches.is_empty() || output_indicates_symbol_problem(&output))
+            && prepare_symbols.unwrap_or(true)
+        {
+            match self
+                .prepare_symbols(PrepareSymbolsArgs {
+                    session_id: session_id.map(str::to_string),
+                    module: Some("nt".to_string()),
+                    symbol_cache: None,
+                    symbol_server: None,
+                    force_mismatched: None,
+                })
+                .await
+            {
+                Ok(payload) => steps.push(json!({
+                    "tool": "windbg_prepare_symbols",
+                    "result": payload,
+                })),
+                Err(error) => steps.push(json!({
+                    "tool": "windbg_prepare_symbols",
+                    "error": format!("{error:?}"),
+                })),
+            }
+
+            let (retry_step, retry_output) =
+                self.diagnostic_command_step(session_id, &command).await;
+            steps.push(retry_step);
+            matches = parse_processes(&retry_output)
+                .into_iter()
+                .filter(|process| process_matches(process, name, pid))
+                .collect();
+        }
+
+        Ok((steps, matches))
+    }
+
+    async fn find_process(&self, args: FindProcessArgs) -> Result<Value, McpError> {
+        let (steps, matches) = self
+            .lookup_processes(
+                args.session_id.as_deref(),
+                args.name.as_deref(),
+                args.pid.as_deref(),
+                args.prepare_symbols,
+            )
+            .await?;
+
+        Ok(json!({
+            "matches": matches,
+            "steps": steps,
+        }))
+    }
+
+    async fn resolve_process_for_breakpoint(
+        &self,
+        args: &SetProcessBreakpointArgs,
+    ) -> Result<(Vec<Value>, ProcessInfo, Vec<ProcessInfo>), McpError> {
+        if let Some(eprocess) = trimmed_nonempty(args.eprocess.as_deref()) {
+            return Ok((
+                Vec::new(),
+                ProcessInfo {
+                    eprocess: debugger_atom(eprocess, "eprocess")
+                        .map_err(|error| McpError::invalid_params(error, None))?,
+                    pid: args.pid.clone(),
+                    image: args.process_name.clone(),
+                    summary: "Provided directly by caller.".to_string(),
+                },
+                Vec::new(),
+            ));
+        }
+
+        if trimmed_nonempty(args.process_name.as_deref()).is_none()
+            && trimmed_nonempty(args.pid.as_deref()).is_none()
+        {
+            return Err(McpError::invalid_params(
+                "provide `eprocess`, `process_name`, or `pid` for a process-scoped breakpoint",
+                None,
+            ));
+        }
+
+        let (steps, matches) = self
+            .lookup_processes(
+                args.session_id.as_deref(),
+                args.process_name.as_deref(),
+                args.pid.as_deref(),
+                args.prepare_symbols,
+            )
+            .await?;
+        if matches.is_empty() {
+            return Err(McpError::invalid_params(
+                "no process matched the provided process_name/pid; use windbg_find_process to inspect candidates",
+                None,
+            ));
+        }
+
+        let selected_index = args.match_index.unwrap_or(0);
+        let Some(selected) = matches.get(selected_index).cloned() else {
+            return Err(McpError::invalid_params(
+                format!(
+                    "match_index {selected_index} is out of range for {} matched process(es)",
+                    matches.len()
+                ),
+                None,
+            ));
+        };
+
+        Ok((steps, selected, matches))
+    }
+
+    async fn set_process_breakpoint(
+        &self,
+        args: SetProcessBreakpointArgs,
+    ) -> Result<Value, McpError> {
+        let (mut steps, process, candidates) = self.resolve_process_for_breakpoint(&args).await?;
+        let ethread = match trimmed_nonempty(args.ethread.as_deref()) {
+            Some(value) => Some(
+                debugger_atom(value, "ethread")
+                    .map_err(|error| McpError::invalid_params(error, None))?,
+            ),
+            None => None,
+        };
+        let command = build_breakpoint_command(
+            args.kind.as_deref(),
+            &args.location,
+            args.one_shot,
+            Some(&process.eprocess),
+            ethread.as_deref(),
+            args.pass_count,
+            args.command.as_deref(),
+        )
+        .map_err(|error| McpError::invalid_params(error, None))?;
+
+        let set = self
+            .execute_debugger_command(args.session_id.as_deref(), command.clone())
+            .await?;
+        let list = self
+            .execute_debugger_command(args.session_id.as_deref(), "bl".to_string())
+            .await?;
+        steps.push(json!({
+            "tool": "windbg_set_process_breakpoint",
+            "command": command,
+        }));
+
+        Ok(json!({
+            "process": process,
+            "candidates": candidates,
+            "steps": steps,
+            "breakpoint": render_execution_result(set),
+            "breakpoints": render_execution_result(list),
+        }))
+    }
+
+    async fn set_syscall_breakpoint(
+        &self,
+        args: SetSyscallBreakpointArgs,
+    ) -> Result<Value, McpError> {
+        let location = normalize_syscall_location(&args.syscall)
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        self.set_process_breakpoint(SetProcessBreakpointArgs {
+            session_id: args.session_id,
+            location,
+            process_name: args.process_name,
+            pid: args.pid,
+            eprocess: args.eprocess,
+            ethread: None,
+            kind: Some("bp".to_string()),
+            one_shot: args.one_shot,
+            pass_count: None,
+            command: args.command,
+            prepare_symbols: args.prepare_symbols,
+            match_index: args.match_index,
+        })
+        .await
     }
 
     async fn list_breakpoints(&self, args: ListBreakpointsArgs) -> Result<Value, McpError> {
@@ -1422,7 +1898,7 @@ impl WindbgMcpServer {
 impl ServerHandler for WindbgMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.is_headless() {
-            "Open a session with `windbg_open_session` before using debugger actions. Use `windbg_set_breakpoint`, `windbg_continue_until_break`, `windbg_breakpoint_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common reverse-engineering flows. Use `windbg_execute_command` for raw WinDbg commands, `windbg_get_output` with cursors for buffered output, and `windbg_resume_target` to continue a live target without blocking on raw `g`. Use `windbg_recover_session` if a live KDNET target may have been left broken. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
+            "Open a session with `windbg_open_session` before using debugger actions. Use `windbg_set_breakpoint`, `windbg_find_process`, `windbg_set_process_breakpoint`, `windbg_set_syscall_breakpoint`, `windbg_continue_until_break`, `windbg_breakpoint_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common reverse-engineering flows. Use `windbg_execute_command` for raw WinDbg commands, `windbg_get_output` with cursors for buffered output, and `windbg_resume_target` to continue a live target without blocking on raw `g`. Use `windbg_recover_session` if a live KDNET target may have been left broken. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
         } else {
             "This server is organized around low-context resources plus a small toolset. Start with `windbg_search_catalog`, read `windbg://command/{id}`, optionally escalate to `windbg://command-full/{id}`, then call `windbg_get_execution_state`. If the debugger is running or busy, call `windbg_interrupt_target` and verify state again before calling `windbg_execute_command`. Use `windbg_get_output` to read buffered command output again later, and `windbg_resume_target` to continue execution without issuing a raw `g` command."
         };
@@ -1459,6 +1935,9 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_prepare_symbols" => Some(self.prepare_symbols_tool()),
             "windbg_diagnose_extensions" => Some(self.diagnose_extensions_tool()),
             "windbg_set_breakpoint" => Some(self.set_breakpoint_tool()),
+            "windbg_find_process" => Some(self.find_process_tool()),
+            "windbg_set_process_breakpoint" => Some(self.set_process_breakpoint_tool()),
+            "windbg_set_syscall_breakpoint" => Some(self.set_syscall_breakpoint_tool()),
             "windbg_list_breakpoints" => Some(self.list_breakpoints_tool()),
             "windbg_clear_breakpoint" => Some(self.clear_breakpoint_tool()),
             "windbg_read_registers" => Some(self.read_registers_tool()),
@@ -1523,6 +2002,21 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_set_breakpoint" => {
                 let args: SetBreakpointArgs = self.parse_arguments(request.arguments)?;
                 let payload = self.set_breakpoint(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_find_process" => {
+                let args: FindProcessArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.find_process(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_set_process_breakpoint" => {
+                let args: SetProcessBreakpointArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.set_process_breakpoint(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_set_syscall_breakpoint" => {
+                let args: SetSyscallBreakpointArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.set_syscall_breakpoint(args).await?;
                 Ok(CallToolResult::structured(payload))
             }
             "windbg_list_breakpoints" => {
@@ -1909,6 +2403,9 @@ mod tests {
 
         for name in [
             "windbg_set_breakpoint",
+            "windbg_find_process",
+            "windbg_set_process_breakpoint",
+            "windbg_set_syscall_breakpoint",
             "windbg_list_breakpoints",
             "windbg_clear_breakpoint",
             "windbg_read_registers",
@@ -1943,6 +2440,65 @@ mod tests {
         assert_eq!(
             memory_command("rcx", Some("poi"), Some(2)).expect("poi format"),
             "dq poi(rcx) L2"
+        );
+    }
+
+    #[test]
+    fn builds_process_scoped_breakpoint_commands() {
+        assert_eq!(
+            build_breakpoint_command(
+                Some("bp"),
+                "nt!NtCreateFile",
+                Some(true),
+                Some("ffff800ff5aa7040"),
+                None,
+                None,
+                Some("r; kv 8")
+            )
+            .expect("process breakpoint command"),
+            r#"bp /1 /p ffff800ff5aa7040 nt!NtCreateFile "r; kv 8""#
+        );
+    }
+
+    #[test]
+    fn parses_process_blocks_from_process_extension_output() {
+        let output = r#"
+PROCESS ffff800ff5aa7040
+    SessionId: none  Cid: 0004    Peb: 00000000  ParentCid: 0000
+    DirBase: 001ae000  ObjectTable: ffffb28f9fc5bc80  HandleCount: 2263.
+    Image: System
+
+PROCESS ffff800ff6bb8040
+    SessionId: 1  Cid: 224    Peb: 00000000  ParentCid: 0004
+    Image: ShadowGateApp.exe
+"#;
+
+        let processes = parse_processes(output);
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].eprocess, "ffff800ff5aa7040");
+        assert_eq!(processes[0].pid.as_deref(), Some("0004"));
+        assert_eq!(processes[0].image.as_deref(), Some("System"));
+        assert!(process_matches(
+            &processes[1],
+            Some("shadowgate*.exe"),
+            None
+        ));
+        assert!(process_matches(&processes[1], None, Some("0n548")));
+    }
+
+    #[test]
+    fn normalizes_common_syscall_breakpoint_names() {
+        assert_eq!(
+            normalize_syscall_location("NtCreateFile").expect("ntcreatefile"),
+            "nt!NtCreateFile"
+        );
+        assert_eq!(
+            normalize_syscall_location("DeviceIoControl").expect("device io control"),
+            "nt!NtDeviceIoControlFile"
+        );
+        assert_eq!(
+            normalize_syscall_location("nt!ZwCreateFile").expect("explicit symbol"),
+            "nt!ZwCreateFile"
         );
     }
 

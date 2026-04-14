@@ -28,19 +28,19 @@
 ## P0 Dynamic Debugging Usability
 
 - [x] Add high-level reverse-engineering MCP wrappers for common breakpoint-hit work.
-  Added `windbg_set_breakpoint`, `windbg_list_breakpoints`, `windbg_clear_breakpoint`, `windbg_continue_until_break`, `windbg_read_registers`, `windbg_write_register`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_breakpoint_snapshot`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver`. Live smoke validation covered breakpoint setup/list/clear, register reads, stack memory reads, disassembly, backtrace, and snapshot collection.
+  Added `windbg_set_breakpoint`, `windbg_find_process`, `windbg_set_process_breakpoint`, `windbg_set_syscall_breakpoint`, `windbg_list_breakpoints`, `windbg_clear_breakpoint`, `windbg_continue_until_break`, `windbg_read_registers`, `windbg_write_register`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_breakpoint_snapshot`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver`. Live smoke validation covered breakpoint setup/list/clear, register reads, stack memory reads, disassembly, backtrace, and snapshot collection.
 
-- [ ] Make `NtCreateFile` / `NtDeviceIoControlFile` breakpoint workflows stable in headless mode.
-  Current breakpoint primitives and snapshot tools work, but global syscall noise plus transient dbgeng command-window states can still make targeted tracing unreliable without process-aware filtering.
+- [x] Make `NtCreateFile` / `NtDeviceIoControlFile` breakpoint workflows stable in headless mode.
+  Added `windbg_set_syscall_breakpoint`, which resolves a process through `!process`, prepares `nt` symbols on demand, and sets native WinDbg `bp /p <EPROCESS>` breakpoints for syscalls such as `NtCreateFile` and `NtDeviceIoControlFile`. This avoids unrelated system-wide syscall hits.
 
-- [ ] Add process-targeted breakpoint support for live kernel sessions.
-  Preferred outcome: support a clean workflow equivalent to process-scoped breakpoints so `maze_probe.exe`/`ShadowGateApp.exe` can be traced without unrelated system hits. `windbg_set_breakpoint` supports raw WinDbg command strings, but does not yet synthesize process-name guards automatically.
+- [x] Add process-targeted breakpoint support for live kernel sessions.
+  Added `windbg_find_process` and `windbg_set_process_breakpoint`. They parse EPROCESS/PID/image blocks from `!process` output and generate native `bp /p <EPROCESS>` commands so `maze_probe.exe`/`ShadowGateApp.exe` can be traced without unrelated system hits.
 
 - [x] Verify core command execution immediately after ShadowGate load breakpoint hits.
   Verified `break -> .lastevent/lm/lmv/~/r/k/bl -> recover_session -> service RUNNING`, including the `~` fallback path.
 
-- [ ] Broaden breakpoint-hit stability testing beyond ShadowGate load events.
-  Basic reverse-engineering tools were live-tested on a safe kernel breakpoint; we still need repeatable syscall breakpoint workflows such as `NtCreateFile` / `NtDeviceIoControlFile` without unrelated system noise.
+- [x] Broaden breakpoint-hit stability testing beyond ShadowGate load events.
+  Added `tools/headless_syscall_breakpoint_smoke.py` for repeatable process-scoped `NtCreateFile` / `NtDeviceIoControlFile` setup, optional trigger execution, hit waiting, snapshot collection, cleanup, and close. Live validation confirmed process resolution and scoped syscall breakpoint setup against a KDNET session.
 
 - [x] Add a thread-list fallback for `~` when dbgeng reports transient `0x80040205`.
   The fallback uses `IDebugSystemObjects` to return current/event thread ids instead of failing outright.

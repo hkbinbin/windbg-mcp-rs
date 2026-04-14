@@ -37,6 +37,8 @@ pub fn render_guide(catalog: &Catalog) -> String {
     output.push_str("- windbg_resume_target\n");
     output.push_str("- windbg_execute_command\n");
     output.push_str("- windbg_set_breakpoint / windbg_continue_until_break\n");
+    output.push_str("- windbg_find_process / windbg_set_process_breakpoint\n");
+    output.push_str("- windbg_set_syscall_breakpoint\n");
     output.push_str("- windbg_read_registers / windbg_read_memory\n");
     output.push_str("- windbg_disassemble / windbg_backtrace\n");
     output.push_str("- windbg_breakpoint_snapshot\n");
