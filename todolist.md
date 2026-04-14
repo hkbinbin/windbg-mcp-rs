@@ -42,6 +42,10 @@
 - [x] Broaden breakpoint-hit stability testing beyond ShadowGate load events.
   Added `tools/headless_syscall_breakpoint_smoke.py` for repeatable process-scoped `NtCreateFile` / `NtDeviceIoControlFile` setup, optional trigger execution, hit waiting, snapshot collection, cleanup, and close. Live validation confirmed process resolution and scoped syscall breakpoint setup against a KDNET session.
 
+- [x] Add driver-centric MCP wrappers for kernel-driver debugging.
+  Added tools for driver load events, driver summaries, parsed IRP dispatch tables, dispatch-handler breakpoint setup, and dispatch-hit snapshots so clients can debug kernel drivers without manually stitching `sxe`, `!drvobj`, `!irp`, register, stack, memory, and breakpoint commands together.
+  Live validation found dbgeng can crash if symbol preparation is attempted after synthetic load-filter changes. `windbg_set_driver_load_breakpoint` now prepares `nt` symbols before mutating `sxe/sxd ld:<image>` filters, while summary/dispatch tools leave post-filter symbol preparation opt-in.
+
 - [x] Add a thread-list fallback for `~` when dbgeng reports transient `0x80040205`.
   The fallback uses `IDebugSystemObjects` to return current/event thread ids instead of failing outright.
 

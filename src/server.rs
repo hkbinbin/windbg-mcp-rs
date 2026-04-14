@@ -218,6 +218,43 @@ struct InspectDriverArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct SetDriverLoadBreakpointArgs {
+    session_id: Option<String>,
+    image: String,
+    clear_existing: Option<bool>,
+    prepare_symbols: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DriverSummaryArgs {
+    session_id: Option<String>,
+    name: String,
+    device: Option<String>,
+    module_pattern: Option<String>,
+    prepare_symbols: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetDriverDispatchBreakpointsArgs {
+    session_id: Option<String>,
+    driver: String,
+    functions: Option<Vec<String>>,
+    include_default_handlers: Option<bool>,
+    one_shot: Option<bool>,
+    command: Option<String>,
+    prepare_symbols: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct DriverDispatchSnapshotArgs {
+    session_id: Option<String>,
+    irp: Option<String>,
+    driver_object: Option<String>,
+    stack_count: Option<u32>,
+    memory_count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct SearchCatalogArgs {
     query: String,
     section: Option<CatalogSection>,
@@ -256,6 +293,15 @@ struct ProcessInfo {
     pid: Option<String>,
     image: Option<String>,
     summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DriverDispatchRoutine {
+    index: Option<String>,
+    major_function: String,
+    target: String,
+    symbol: Option<String>,
+    raw: String,
 }
 
 #[derive(Clone)]
@@ -328,6 +374,9 @@ fn output_indicates_symbol_problem(output: &str) -> bool {
     lower.contains("symbols are incorrect")
         || lower.contains("symbol file could not be found")
         || (lower.contains("mismatched") && lower.contains("symbol"))
+        || lower.contains("doesn't have full symbol information")
+        || lower.contains("doesnt have full symbol information")
+        || (lower.contains("cannot find") && lower.contains("type"))
 }
 
 fn chain_contains_extension(chain_output: &str, extension: &str) -> bool {
@@ -624,6 +673,124 @@ fn normalize_syscall_location(syscall: &str) -> Result<String, String> {
     Ok(format!("nt!{name}"))
 }
 
+fn driver_short_name(name: &str) -> &str {
+    let short_name = name
+        .trim()
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(name)
+        .trim();
+    if short_name.to_ascii_lowercase().ends_with(".sys") {
+        &short_name[..short_name.len() - 4]
+    } else {
+        short_name
+    }
+}
+
+fn parse_driver_dispatch_routines(output: &str) -> Vec<DriverDispatchRoutine> {
+    let mut routines = Vec::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if !trimmed.contains("IRP_MJ_") {
+            continue;
+        }
+
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        let Some(major_index) = tokens.iter().position(|token| token.contains("IRP_MJ_")) else {
+            continue;
+        };
+
+        let major_function = tokens[major_index]
+            .trim_matches(|ch| matches!(ch, ':' | ',' | ';'))
+            .to_string();
+        let Some(target) = tokens
+            .get(major_index + 1)
+            .map(|value| value.trim_matches(|ch| matches!(ch, ':' | ',' | ';')))
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let symbol = tokens
+            .get(major_index + 2)
+            .map(|value| value.trim_matches(|ch| matches!(ch, ':' | ',' | ';')))
+            .filter(|value| !value.is_empty() && !value.starts_with('+'))
+            .map(str::to_string);
+        let index = tokens[..major_index].iter().find_map(|token| {
+            let token = token.trim();
+            token
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .map(str::to_string)
+        });
+
+        routines.push(DriverDispatchRoutine {
+            index,
+            major_function,
+            target: target.to_string(),
+            symbol,
+            raw: trimmed.to_string(),
+        });
+    }
+
+    routines
+}
+
+fn normalize_dispatch_filter(value: &str) -> String {
+    let value = value
+        .trim()
+        .trim_matches(['[', ']'])
+        .replace(['-', ' '], "_");
+    let upper = value.to_ascii_uppercase();
+    if upper.starts_with("IRP_MJ_") {
+        upper
+    } else if upper.starts_with("MJ_") {
+        format!("IRP_{upper}")
+    } else {
+        format!("IRP_MJ_{upper}")
+    }
+}
+
+fn dispatch_filter_matches(routine: &DriverDispatchRoutine, filter: &str) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return false;
+    }
+
+    let index_filter = filter
+        .trim_matches(['[', ']'])
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    if routine
+        .index
+        .as_deref()
+        .is_some_and(|index| index.eq_ignore_ascii_case(index_filter))
+    {
+        return true;
+    }
+
+    routine
+        .major_function
+        .eq_ignore_ascii_case(&normalize_dispatch_filter(filter))
+}
+
+fn is_default_dispatch_target(target: &str) -> bool {
+    let lower = target.to_ascii_lowercase();
+    lower.contains("iopinvaliddevicerequest") || lower == "0" || lower == "00000000"
+}
+
+fn is_default_dispatch_routine(routine: &DriverDispatchRoutine) -> bool {
+    is_default_dispatch_target(&routine.target)
+        || routine
+            .symbol
+            .as_deref()
+            .is_some_and(is_default_dispatch_target)
+        || routine
+            .raw
+            .to_ascii_lowercase()
+            .contains("iopinvaliddevicerequest")
+}
+
 fn default_symbol_cache_dir() -> PathBuf {
     std::env::var_os("WINDBG_MCP_SYMBOL_CACHE")
         .map(PathBuf::from)
@@ -891,6 +1058,42 @@ impl WindbgMcpServer {
         .with_title("Inspect driver object")
     }
 
+    fn set_driver_load_breakpoint_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_set_driver_load_breakpoint",
+            "Prepare kernel symbols by default, then break when a kernel driver image loads by configuring `sxe ld:<image>` and returning the event filter list.",
+            schema_for_type::<SetDriverLoadBreakpointArgs>(),
+        )
+        .with_title("Set driver load breakpoint")
+    }
+
+    fn driver_summary_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_driver_summary",
+            "Collect a driver-oriented summary: module listing, `!drvobj <name> 7`, object checks, optional device object checks, and parsed IRP dispatch routines.",
+            schema_for_type::<DriverSummaryArgs>(),
+        )
+        .with_title("Driver summary")
+    }
+
+    fn set_driver_dispatch_breakpoints_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_set_driver_dispatch_breakpoints",
+            "Parse `!drvobj <driver> 7` and set breakpoints on selected IRP_MJ dispatch routines, defaulting to create/close/device-control when available.",
+            schema_for_type::<SetDriverDispatchBreakpointsArgs>(),
+        )
+        .with_title("Set driver dispatch breakpoints")
+    }
+
+    fn driver_dispatch_snapshot_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_driver_dispatch_snapshot",
+            "Collect a dispatch breakpoint snapshot: last event, registers, IRP details, driver object details, stack, RIP disassembly, memory, and breakpoints.",
+            schema_for_type::<DriverDispatchSnapshotArgs>(),
+        )
+        .with_title("Driver dispatch snapshot")
+    }
+
     fn interrupt_tool(&self) -> Tool {
         Tool::new(
             "windbg_interrupt_target",
@@ -1015,6 +1218,10 @@ impl WindbgMcpServer {
             self.list_modules_tool(),
             self.search_symbols_tool(),
             self.inspect_driver_tool(),
+            self.set_driver_load_breakpoint_tool(),
+            self.driver_summary_tool(),
+            self.set_driver_dispatch_breakpoints_tool(),
+            self.driver_dispatch_snapshot_tool(),
             self.search_tool(),
             self.interrupt_tool(),
             self.resume_tool(),
@@ -1785,6 +1992,338 @@ impl WindbgMcpServer {
         .await
     }
 
+    async fn set_driver_load_breakpoint(
+        &self,
+        args: SetDriverLoadBreakpointArgs,
+    ) -> Result<Value, McpError> {
+        let image = debugger_atom(&args.image, "image")
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        let event_filter = format!("ld:{image}");
+        let mut steps = Vec::new();
+        if args.prepare_symbols.unwrap_or(true) {
+            match self
+                .prepare_symbols(PrepareSymbolsArgs {
+                    session_id: args.session_id.clone(),
+                    module: Some("nt".to_string()),
+                    symbol_cache: None,
+                    symbol_server: None,
+                    force_mismatched: None,
+                })
+                .await
+            {
+                Ok(payload) => steps.push(json!({
+                    "tool": "windbg_prepare_symbols",
+                    "phase": "before_load_filter",
+                    "result": payload,
+                })),
+                Err(error) => steps.push(json!({
+                    "tool": "windbg_prepare_symbols",
+                    "phase": "before_load_filter",
+                    "error": format!("{error:?}"),
+                })),
+            }
+        }
+
+        let mut commands = Vec::new();
+        if args.clear_existing.unwrap_or(false) {
+            commands.push(format!("sxd {event_filter}"));
+        }
+        commands.push(format!("sxe {event_filter}"));
+        commands.push("sx".to_string());
+
+        for command in commands {
+            let (step, _) = self
+                .diagnostic_command_step(args.session_id.as_deref(), &command)
+                .await;
+            steps.push(step);
+        }
+
+        Ok(json!({
+            "image": image,
+            "event_filter": event_filter,
+            "steps": steps,
+            "symbols_prepared_before_filter": args.prepare_symbols.unwrap_or(true),
+            "next_step": "resume the target with windbg_continue_until_break or windbg_resume_target, then start/load the driver from the guest",
+        }))
+    }
+
+    async fn driver_summary(&self, args: DriverSummaryArgs) -> Result<Value, McpError> {
+        let name = debugger_atom(&args.name, "driver")
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        let short_name = driver_short_name(&name);
+        let module_pattern = match trimmed_nonempty(args.module_pattern.as_deref()) {
+            Some(pattern) => debugger_atom(pattern, "module_pattern")
+                .map_err(|error| McpError::invalid_params(error, None))?,
+            None if short_name.is_empty() => "*".to_string(),
+            None => format!("{short_name}*"),
+        };
+        let object_path = if name.starts_with('\\') {
+            name.clone()
+        } else {
+            format!(r"\Driver\{short_name}")
+        };
+        let device = match trimmed_nonempty(args.device.as_deref()) {
+            Some(device) => Some(
+                debugger_atom(device, "device")
+                    .map_err(|error| McpError::invalid_params(error, None))?,
+            ),
+            None => None,
+        };
+
+        let mut steps = Vec::new();
+        if args.prepare_symbols.unwrap_or(false) {
+            match self
+                .prepare_symbols(PrepareSymbolsArgs {
+                    session_id: args.session_id.clone(),
+                    module: Some("nt".to_string()),
+                    symbol_cache: None,
+                    symbol_server: None,
+                    force_mismatched: None,
+                })
+                .await
+            {
+                Ok(payload) => steps.push(json!({
+                    "tool": "windbg_prepare_symbols",
+                    "result": payload,
+                })),
+                Err(error) => steps.push(json!({
+                    "tool": "windbg_prepare_symbols",
+                    "error": format!("{error:?}"),
+                })),
+            }
+        }
+
+        let (module_step, _) = self
+            .diagnostic_command_step(
+                args.session_id.as_deref(),
+                &format!("lm m {module_pattern}"),
+            )
+            .await;
+        steps.push(module_step);
+
+        let (drvobj_step, drvobj_output) = self
+            .diagnostic_command_step(args.session_id.as_deref(), &format!("!drvobj {name} 7"))
+            .await;
+        steps.push(drvobj_step);
+
+        let (driver_object_step, _) = self
+            .diagnostic_command_step(
+                args.session_id.as_deref(),
+                &format!("!object {object_path}"),
+            )
+            .await;
+        steps.push(driver_object_step);
+
+        if let Some(device) = device.as_deref() {
+            for command in [
+                format!("!object {device}"),
+                format!("!devobj {device}"),
+                format!("!devstack {device}"),
+            ] {
+                let (step, _) = self
+                    .diagnostic_command_step(args.session_id.as_deref(), &command)
+                    .await;
+                steps.push(step);
+            }
+        }
+
+        let dispatch_routines = parse_driver_dispatch_routines(&drvobj_output);
+        let symbol_problem = output_indicates_symbol_problem(&drvobj_output);
+        let recommendations: Vec<&str> = if dispatch_routines.is_empty() && symbol_problem {
+            vec![
+                "prepare nt symbols before configuring driver-load filters, or call this tool with prepare_symbols=true in a fresh/broken session",
+                "if a load filter was just configured, prefer windbg_set_driver_load_breakpoint with its default prepare_symbols=true before retrying driver inspection",
+            ]
+        } else {
+            Vec::new()
+        };
+        Ok(json!({
+            "driver": name,
+            "short_name": short_name,
+            "module_pattern": module_pattern,
+            "driver_object_path": object_path,
+            "device": device,
+            "symbol_problem": symbol_problem,
+            "recommendations": recommendations,
+            "dispatch_routines": dispatch_routines,
+            "steps": steps,
+            "next_tools": [
+                "windbg_set_driver_dispatch_breakpoints",
+                "windbg_driver_dispatch_snapshot",
+                "windbg_read_memory",
+                "windbg_backtrace"
+            ],
+        }))
+    }
+
+    async fn set_driver_dispatch_breakpoints(
+        &self,
+        args: SetDriverDispatchBreakpointsArgs,
+    ) -> Result<Value, McpError> {
+        let driver = debugger_atom(&args.driver, "driver")
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        let include_default_handlers = args.include_default_handlers.unwrap_or(false);
+        let mut steps = Vec::new();
+
+        if args.prepare_symbols.unwrap_or(false) {
+            match self
+                .prepare_symbols(PrepareSymbolsArgs {
+                    session_id: args.session_id.clone(),
+                    module: Some("nt".to_string()),
+                    symbol_cache: None,
+                    symbol_server: None,
+                    force_mismatched: None,
+                })
+                .await
+            {
+                Ok(payload) => steps.push(json!({
+                    "tool": "windbg_prepare_symbols",
+                    "result": payload,
+                })),
+                Err(error) => steps.push(json!({
+                    "tool": "windbg_prepare_symbols",
+                    "error": format!("{error:?}"),
+                })),
+            }
+        }
+
+        let (drvobj_step, drvobj_output) = self
+            .diagnostic_command_step(args.session_id.as_deref(), &format!("!drvobj {driver} 7"))
+            .await;
+        steps.push(drvobj_step);
+        let routines = parse_driver_dispatch_routines(&drvobj_output);
+        if routines.is_empty() {
+            return Ok(json!({
+                "driver": driver,
+                "dispatch_routines": routines,
+                "selected": [],
+                "breakpoints_set": [],
+                "warning": "no IRP_MJ dispatch routines were parsed from !drvobj output; verify symbols/extensions and the driver name. If load filters were recently configured, prepare symbols before setting the load filter or retry in a fresh session.",
+                "steps": steps,
+            }));
+        }
+
+        let default_filters = ["IRP_MJ_CREATE", "IRP_MJ_CLOSE", "IRP_MJ_DEVICE_CONTROL"];
+        let requested_filters: Vec<String> = match args.functions.as_ref() {
+            Some(functions) => functions
+                .iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect(),
+            None => default_filters
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        };
+        let mut selection_mode = if args.functions.is_some() {
+            "explicit".to_string()
+        } else {
+            "common_default".to_string()
+        };
+        let mut selected: Vec<DriverDispatchRoutine> = routines
+            .iter()
+            .filter(|routine| {
+                requested_filters
+                    .iter()
+                    .any(|filter| dispatch_filter_matches(routine, filter))
+            })
+            .filter(|routine| include_default_handlers || !is_default_dispatch_routine(routine))
+            .cloned()
+            .collect();
+
+        if args.functions.is_none() && selected.is_empty() {
+            selection_mode = "all_non_default_fallback".to_string();
+            selected = routines
+                .iter()
+                .filter(|routine| include_default_handlers || !is_default_dispatch_routine(routine))
+                .cloned()
+                .collect();
+        }
+
+        let mut breakpoints_set = Vec::new();
+        for routine in &selected {
+            let command = build_breakpoint_command(
+                Some("bp"),
+                &routine.target,
+                args.one_shot,
+                None,
+                None,
+                None,
+                args.command.as_deref(),
+            )
+            .map_err(|error| McpError::invalid_params(error, None))?;
+            let result = self
+                .execute_debugger_command(args.session_id.as_deref(), command.clone())
+                .await?;
+            breakpoints_set.push(json!({
+                "routine": routine,
+                "command": command,
+                "result": render_execution_result(result),
+            }));
+        }
+
+        let breakpoints = self
+            .execute_debugger_command(args.session_id.as_deref(), "bl".to_string())
+            .await?;
+
+        Ok(json!({
+            "driver": driver,
+            "selection_mode": selection_mode,
+            "requested_functions": requested_filters,
+            "include_default_handlers": include_default_handlers,
+            "dispatch_routines": routines,
+            "selected": selected,
+            "breakpoints_set": breakpoints_set,
+            "breakpoints": render_execution_result(breakpoints),
+            "steps": steps,
+        }))
+    }
+
+    async fn driver_dispatch_snapshot(
+        &self,
+        args: DriverDispatchSnapshotArgs,
+    ) -> Result<Value, McpError> {
+        let irp = match trimmed_nonempty(args.irp.as_deref()) {
+            Some(value) => debugger_atom(value, "irp")
+                .map_err(|error| McpError::invalid_params(error, None))?,
+            None => "@rdx".to_string(),
+        };
+        let driver_object = match trimmed_nonempty(args.driver_object.as_deref()) {
+            Some(value) => debugger_atom(value, "driver_object")
+                .map_err(|error| McpError::invalid_params(error, None))?,
+            None => "@rcx".to_string(),
+        };
+        let stack_count = clamp_count(args.stack_count, 32, 512);
+        let memory_count = clamp_count(args.memory_count, 32, 1024);
+        let commands = vec![
+            ".lastevent".to_string(),
+            "r".to_string(),
+            format!("!irp {irp}"),
+            format!("dt nt!_IRP {irp}"),
+            format!("dq {irp} L{memory_count}"),
+            format!("dt nt!_DRIVER_OBJECT {driver_object}"),
+            format!("!drvobj {driver_object} 7"),
+            format!("dq {driver_object} L16"),
+            format!("kv {stack_count}"),
+            "u rip L16".to_string(),
+            "bl".to_string(),
+        ];
+
+        let mut steps = Vec::new();
+        for command in commands {
+            let (step, _) = self
+                .diagnostic_command_step(args.session_id.as_deref(), &command)
+                .await;
+            steps.push(step);
+        }
+
+        Ok(json!({
+            "irp": irp,
+            "driver_object": driver_object,
+            "steps": steps,
+        }))
+    }
+
     async fn query_state(&self, session_id: Option<&str>) -> Result<Value, McpError> {
         let state = match &self.backend {
             ServerBackend::AttachedSession { dispatcher } => dispatcher
@@ -1898,7 +2437,7 @@ impl WindbgMcpServer {
 impl ServerHandler for WindbgMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.is_headless() {
-            "Open a session with `windbg_open_session` before using debugger actions. Use `windbg_set_breakpoint`, `windbg_find_process`, `windbg_set_process_breakpoint`, `windbg_set_syscall_breakpoint`, `windbg_continue_until_break`, `windbg_breakpoint_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common reverse-engineering flows. Use `windbg_execute_command` for raw WinDbg commands, `windbg_get_output` with cursors for buffered output, and `windbg_resume_target` to continue a live target without blocking on raw `g`. Use `windbg_recover_session` if a live KDNET target may have been left broken. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
+            "Open a session with `windbg_open_session` before using debugger actions. Use `windbg_set_breakpoint`, `windbg_find_process`, `windbg_set_process_breakpoint`, `windbg_set_syscall_breakpoint`, `windbg_set_driver_load_breakpoint`, `windbg_driver_summary`, `windbg_set_driver_dispatch_breakpoints`, `windbg_driver_dispatch_snapshot`, `windbg_continue_until_break`, `windbg_breakpoint_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common reverse-engineering and kernel-driver flows. Use `windbg_execute_command` for raw WinDbg commands, `windbg_get_output` with cursors for buffered output, and `windbg_resume_target` to continue a live target without blocking on raw `g`. Use `windbg_recover_session` if a live KDNET target may have been left broken. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
         } else {
             "This server is organized around low-context resources plus a small toolset. Start with `windbg_search_catalog`, read `windbg://command/{id}`, optionally escalate to `windbg://command-full/{id}`, then call `windbg_get_execution_state`. If the debugger is running or busy, call `windbg_interrupt_target` and verify state again before calling `windbg_execute_command`. Use `windbg_get_output` to read buffered command output again later, and `windbg_resume_target` to continue execution without issuing a raw `g` command."
         };
@@ -1951,6 +2490,12 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_list_modules" => Some(self.list_modules_tool()),
             "windbg_search_symbols" => Some(self.search_symbols_tool()),
             "windbg_inspect_driver" => Some(self.inspect_driver_tool()),
+            "windbg_set_driver_load_breakpoint" => Some(self.set_driver_load_breakpoint_tool()),
+            "windbg_driver_summary" => Some(self.driver_summary_tool()),
+            "windbg_set_driver_dispatch_breakpoints" => {
+                Some(self.set_driver_dispatch_breakpoints_tool())
+            }
+            "windbg_driver_dispatch_snapshot" => Some(self.driver_dispatch_snapshot_tool()),
             "windbg_search_catalog" => Some(self.search_tool()),
             "windbg_interrupt_target" => Some(self.interrupt_tool()),
             "windbg_resume_target" => Some(self.resume_tool()),
@@ -2082,6 +2627,27 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_inspect_driver" => {
                 let args: InspectDriverArgs = self.parse_arguments(request.arguments)?;
                 let payload = self.inspect_driver(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_set_driver_load_breakpoint" => {
+                let args: SetDriverLoadBreakpointArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.set_driver_load_breakpoint(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_driver_summary" => {
+                let args: DriverSummaryArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.driver_summary(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_set_driver_dispatch_breakpoints" => {
+                let args: SetDriverDispatchBreakpointsArgs =
+                    self.parse_arguments(request.arguments)?;
+                let payload = self.set_driver_dispatch_breakpoints(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_driver_dispatch_snapshot" => {
+                let args: DriverDispatchSnapshotArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.driver_dispatch_snapshot(args).await?;
                 Ok(CallToolResult::structured(payload))
             }
             "windbg_search_catalog" => {
@@ -2419,6 +2985,10 @@ mod tests {
             "windbg_list_modules",
             "windbg_search_symbols",
             "windbg_inspect_driver",
+            "windbg_set_driver_load_breakpoint",
+            "windbg_driver_summary",
+            "windbg_set_driver_dispatch_breakpoints",
+            "windbg_driver_dispatch_snapshot",
         ] {
             let tool = server
                 .get_tool(name)
@@ -2500,6 +3070,37 @@ PROCESS ffff800ff6bb8040
             normalize_syscall_location("nt!ZwCreateFile").expect("explicit symbol"),
             "nt!ZwCreateFile"
         );
+    }
+
+    #[test]
+    fn parses_driver_dispatch_routines_from_drvobj_output() {
+        let output = r#"
+Dispatch routines:
+[00] IRP_MJ_CREATE                      fffff805`12345678
+[02] IRP_MJ_CLOSE                       fffff805`6a8b9050 nt!IopInvalidDeviceRequest
+[0e] IRP_MJ_DEVICE_CONTROL              ShadowGateSys+0x1234
+"#;
+
+        let routines = parse_driver_dispatch_routines(output);
+
+        assert_eq!(routines.len(), 3);
+        assert_eq!(routines[0].index.as_deref(), Some("00"));
+        assert_eq!(routines[0].major_function, "IRP_MJ_CREATE");
+        assert_eq!(routines[0].target, "fffff805`12345678");
+        assert_eq!(
+            routines[1].symbol.as_deref(),
+            Some("nt!IopInvalidDeviceRequest")
+        );
+        assert!(is_default_dispatch_routine(&routines[1]));
+        assert!(dispatch_filter_matches(&routines[2], "device_control"));
+        assert!(dispatch_filter_matches(&routines[2], "0e"));
+    }
+
+    #[test]
+    fn driver_name_helpers_normalize_common_inputs() {
+        assert_eq!(driver_short_name(r"\Driver\ShadowGate"), "ShadowGate");
+        assert_eq!(driver_short_name("ShadowGateSys.sys"), "ShadowGateSys");
+        assert_eq!(normalize_dispatch_filter("MJ_CREATE"), "IRP_MJ_CREATE");
     }
 
     #[test]

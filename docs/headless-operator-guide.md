@@ -10,7 +10,7 @@ This guide describes the safe rhythm for stdio MCP clients that own a live KDNET
 4. If the state is `break`, run short inspection commands or call `windbg_resume_target`.
 5. Perform guest-side work while the target is running.
 6. Call `windbg_interrupt_target` only when debugger inspection is needed.
-7. Run focused MCP tools while the target is broken: `windbg_breakpoint_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, `windbg_inspect_driver`, `windbg_execute_command`, `windbg_get_output`, `windbg_prepare_symbols`, or extension diagnostics.
+7. Run focused MCP tools while the target is broken: `windbg_breakpoint_snapshot`, `windbg_driver_summary`, `windbg_driver_dispatch_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, `windbg_inspect_driver`, `windbg_execute_command`, `windbg_get_output`, `windbg_prepare_symbols`, or extension diagnostics.
 8. Call `windbg_resume_target` as soon as the inspection is complete.
 9. Call `windbg_close_session` for cleanup; it resumes a broken kernel target before detach by default.
 
@@ -57,9 +57,25 @@ windbg_resume_target
 
 `windbg_set_breakpoint` wraps `bp`, `bu`, and `bm`, including one-shot breakpoints, pass counts, and a WinDbg command string. For noisy global kernel breakpoints, prefer `windbg_set_process_breakpoint` or `windbg_set_syscall_breakpoint`; they resolve the target process with `!process`, prepare `nt` symbols on demand, and set WinDbg's native `bp /p <EPROCESS>` breakpoint.
 
+## Kernel Driver Tools
+
+Prefer the driver-aware MCP wrappers when tracing a kernel driver:
+
+```text
+windbg_set_driver_load_breakpoint {"image":"ShadowGateSys.sys","clear_existing":true}
+windbg_continue_until_break {"timeout_secs":60}
+windbg_driver_summary {"name":"ShadowGate","device":"\\Device\\ShadowGate"}
+windbg_set_driver_dispatch_breakpoints {"driver":"ShadowGate","functions":["IRP_MJ_CREATE","IRP_MJ_CLOSE","IRP_MJ_DEVICE_CONTROL"]}
+windbg_continue_until_break {"timeout_secs":60}
+windbg_driver_dispatch_snapshot {"irp":"@rdx","driver_object":"@rcx","stack_count":32,"memory_count":32}
+windbg_resume_target
+```
+
+`windbg_set_driver_load_breakpoint` prepares `nt` symbols by default before it mutates `sxe/sxd ld:<image>` filters, because some dbgeng builds are unstable when symbol preparation happens after synthetic load-filter changes. `windbg_driver_summary` parses the `!drvobj <name> 7` dispatch table into structured `IRP_MJ_*` entries so an MCP client can choose handlers without scraping raw text. `windbg_set_driver_dispatch_breakpoints` targets create/close/device-control handlers when present and skips default `nt!IopInvalidDeviceRequest` handlers unless `include_default_handlers` is true.
+
 ## Driver Load Breakpoints
 
-Use synthetic load-event breakpoints through normal WinDbg syntax:
+Use `windbg_set_driver_load_breakpoint` for synthetic load-event breakpoints, or use normal WinDbg syntax directly:
 
 ```text
 sxe ld:ShadowGateSys.sys

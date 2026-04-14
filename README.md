@@ -80,6 +80,10 @@ Reverse-engineering convenience tools:
 - `windbg_list_modules`
 - `windbg_search_symbols`
 - `windbg_inspect_driver`
+- `windbg_set_driver_load_breakpoint`
+- `windbg_driver_summary`
+- `windbg_set_driver_dispatch_breakpoints`
+- `windbg_driver_dispatch_snapshot`
 
 `windbg_close_session` tries to resume a broken target before teardown by default; pass `resume_before_close: false` to skip that behavior. For live kernel sessions, close waits briefly before detaching after either an automatic resume or a recently observed running state, so the guest has time to leave the break state. It also accepts an optional `shutdown_timeout_secs` value. The session is removed from the MCP registry first, and the bounded shutdown result reports whether dbgeng teardown completed cleanly or timed out in the background. This keeps live KDNET detach issues from hanging the MCP server.
 
@@ -118,7 +122,9 @@ Pure UI shortcut topics remain available as documentation, and command execution
 
 Recommended agent flow in headless mode: call `windbg_open_session`, optionally `windbg_switch_session`, then follow the same command flow. If extension commands need kernel symbols, call `windbg_prepare_symbols` while broken into the target, and use `windbg_diagnose_extensions` when `.load kdexts` or `!process` is not behaving as expected. If the debugger is running or busy, call `windbg_interrupt_target` explicitly and verify state again before executing the command. Use `windbg_resume_target` to continue execution without issuing a raw `g` command. Use `windbg_get_output` with the returned `next_cursor` to fetch only newly buffered command output.
 
-Recommended breakpoint flow: call `windbg_set_breakpoint`, call `windbg_continue_until_break`, then call `windbg_breakpoint_snapshot` or targeted tools such as `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, and `windbg_backtrace`. For noisy kernel syscalls, call `windbg_find_process` and then `windbg_set_process_breakpoint` or `windbg_set_syscall_breakpoint`; these use WinDbg's native kernel `bp /p <EPROCESS>` support so `NtCreateFile` / `NtDeviceIoControlFile` tracing can be scoped to `ShadowGateApp.exe`, `maze_probe.exe`, or a specific PID. Use `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common symbol/module/driver-object checks.
+Recommended breakpoint flow: call `windbg_set_breakpoint`, call `windbg_continue_until_break`, then call `windbg_breakpoint_snapshot` or targeted tools such as `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, and `windbg_backtrace`. For noisy kernel syscalls, call `windbg_find_process` and then `windbg_set_process_breakpoint` or `windbg_set_syscall_breakpoint`; these use WinDbg's native kernel `bp /p <EPROCESS>` support so `NtCreateFile` / `NtDeviceIoControlFile` tracing can be scoped to `ShadowGateApp.exe`, `maze_probe.exe`, or a specific PID.
+
+Recommended kernel-driver flow: call `windbg_set_driver_load_breakpoint` before starting the driver; it prepares `nt` symbols by default before configuring `sxe ld:<image>` so later driver-object inspection avoids dbgeng's unstable "prepare symbols after load-filter mutation" path. Continue until the load event, then call `windbg_driver_summary` to collect `lm`, `!drvobj`, object/device checks, and parsed `IRP_MJ_*` dispatch routines. Use `windbg_set_driver_dispatch_breakpoints` to place breakpoints on dispatch handlers such as `IRP_MJ_DEVICE_CONTROL`, then use `windbg_driver_dispatch_snapshot` at the breakpoint to collect registers, `!irp`, `_IRP`, `_DRIVER_OBJECT`, stack, RIP disassembly, memory, and current breakpoints. Use `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for lower-level symbol/module/driver-object checks.
 
 ## Development
 
