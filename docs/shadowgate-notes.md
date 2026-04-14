@@ -29,16 +29,27 @@ IOCTL_INFO  = 0x8001200C
 
 ## Movement Encoding
 
-Known direction mapping:
+Known user-facing direction mapping:
 
 ```text
-U -> 0x52
-L -> 0x53
-D -> 0xD3
-R -> 0xD0
+W / U -> 0x52
+A / L -> 0x53
+S / D -> 0xD3
+D / R -> 0xD0
 ```
 
-The move packet uses an `opIndex` value and the marker `0xDEAD1337`.
+The move packet uses a per-move seed/index value and the marker `0xDEAD1337`:
+
+```text
+encoded = rol8(raw_direction ^ 0x5a, 3)
+checksum = encoded ^ seed ^ 0xDEAD1337
+```
+
+The driver decodes with:
+
+```text
+raw_direction = ror8(encoded, 3) ^ 0x5a
+```
 
 ## User-Mode Signals
 
@@ -52,3 +63,26 @@ Global\MazeMoveWall
 ## Validation Scripts
 
 Use `tools/shadowgate_smoke.py` for repeatable command inspection. With guest SSH available, it can start the service, optionally set `sxe ld:ShadowGateSys.sys`, and run the ShadowGate command smoke suite.
+
+## Dynamic Reversing Result
+
+The maze and final transform are documented in `docs/shadowgate-crypto-reversing.md`.
+
+Validated winning user-facing path:
+
+```text
+DDDDDDSSDDDDWWDDSSSSSSSSAASSSSDD
+```
+
+Driver-internal canonical path:
+
+```text
+RRRRRRDDRRRRUURRDDDDDDDDLLDDDDRR
+```
+
+Exit output:
+
+```text
+WIN!
+flag{SHAD0WNT_HYPERVMX}
+```

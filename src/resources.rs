@@ -45,8 +45,9 @@ pub fn render_guide(catalog: &Catalog) -> String {
     output.push_str("- windbg_evaluate_expression / windbg_search_symbols\n");
     output.push_str("- windbg_list_modules / windbg_inspect_driver\n\n");
     output.push_str("- windbg_set_driver_load_breakpoint / windbg_driver_summary\n");
-    output
-        .push_str("- windbg_set_driver_dispatch_breakpoints / windbg_driver_dispatch_snapshot\n\n");
+    output.push_str(
+        "- windbg_set_driver_dispatch_breakpoints / windbg_driver_dispatch_snapshot / windbg_ioctl_snapshot\n\n",
+    );
     output.push_str(&catalog.render_index());
     output
 }

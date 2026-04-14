@@ -46,6 +46,11 @@
   Added tools for driver load events, driver summaries, parsed IRP dispatch tables, dispatch-handler breakpoint setup, and dispatch-hit snapshots so clients can debug kernel drivers without manually stitching `sxe`, `!drvobj`, `!irp`, register, stack, memory, and breakpoint commands together.
   Live validation found dbgeng can crash if symbol preparation is attempted after synthetic load-filter changes. `windbg_set_driver_load_breakpoint` now prepares `nt` symbols before mutating `sxe/sxd ld:<image>` filters, while summary/dispatch tools leave post-filter symbol preparation opt-in.
 
+- [x] Add an IOCTL-focused snapshot tool.
+  Added `windbg_ioctl_snapshot`, which collects `.lastevent`, registers, current disassembly, backtrace, `!irp`, `dt nt!_IRP`, IO stack arguments, and SystemBuffer bytes/dwords/qwords in one call. Live validation on ShadowGate's MOVE branch decoded `0x80012004`, input length `0x0c`, output length `0x84`, and the buffered move packet.
+  Revalidated with a fresh temporary guest P/Invoke trigger rather than the earlier ShadowGate helper scripts, confirming the MCP can set an internal driver breakpoint, break on real `DeviceIoControl`, collect registers/backtrace/disassembly/memory/IRP data, resume the VM, and leave SSH reachable.
+  Follow-up hardening added default IRP auto-detection across common registers, parsed IOCTL metadata in `summary.ioctl`, SystemBuffer byte-prefix extraction, and safer register argument validation.
+
 - [x] Add a thread-list fallback for `~` when dbgeng reports transient `0x80040205`.
   The fallback uses `IDebugSystemObjects` to return current/event thread ids instead of failing outright.
 
@@ -92,6 +97,9 @@
   move packet uses `opIndex` and `0xDEAD1337`
   driver exposes `Global\\MazeMoveOK` and `Global\\MazeMoveWall`
   Captured in `docs/shadowgate-notes.md`.
+
+- [x] Dynamically reverse ShadowGate maze and final transform.
+  Dynamic KDNET tracing captured MOVE input packets, output buffers, live state memory, the winning path, and final transform call arguments. The behavior-equivalent final transform, maze grid, path, and flag materialization are documented in `docs/shadowgate-crypto-reversing.md`.
 
 - [x] Add a regression test plan for `windbg_get_output`.
   Already observed working for `vertarget`; we should verify cursor-based reads across multiple commands and breakpoint hits.

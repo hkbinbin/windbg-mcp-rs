@@ -254,6 +254,19 @@ struct DriverDispatchSnapshotArgs {
     memory_count: Option<u32>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct IoctlSnapshotArgs {
+    session_id: Option<String>,
+    irp: Option<String>,
+    system_buffer: Option<String>,
+    stack_location: Option<String>,
+    auto_detect: Option<bool>,
+    candidate_irps: Option<Vec<String>>,
+    buffer_count: Option<u32>,
+    irp_memory_count: Option<u32>,
+    stack_count: Option<u32>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SearchCatalogArgs {
     query: String,
@@ -302,6 +315,15 @@ struct DriverDispatchRoutine {
     target: String,
     symbol: Option<String>,
     raw: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct IoctlStackArgsSummary {
+    output_buffer_length: u64,
+    input_buffer_length: u64,
+    ioctl_code: u64,
+    type3_input_buffer: u64,
+    raw_values: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -416,6 +438,94 @@ fn debugger_atom(value: &str, field: &str) -> Result<String, String> {
 
 fn clamp_count(value: Option<u32>, default: u32, max: u32) -> u32 {
     value.unwrap_or(default).clamp(1, max)
+}
+
+fn parse_debugger_u64(value: &str) -> Option<u64> {
+    let mut value = value.trim().trim_end_matches(':').replace('`', "");
+    if value.is_empty() {
+        return None;
+    }
+    let radix = if let Some(stripped) = value.strip_prefix("0n") {
+        value = stripped.to_string();
+        10
+    } else {
+        value = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .unwrap_or(&value)
+            .to_string();
+        16
+    };
+    u64::from_str_radix(&value, radix).ok()
+}
+
+fn irp_output_looks_valid(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("irp is active")
+        || lower.contains("irp stack trace")
+        || lower.contains("irp_mj_")
+}
+
+fn parse_irp_system_buffer(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let Some((_, rest)) = line.split_once("System buffer=") else {
+            continue;
+        };
+        let pointer = rest
+            .trim()
+            .trim_end_matches(':')
+            .split(|ch: char| ch.is_whitespace() || ch == ':')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if parse_debugger_u64(pointer).is_some() {
+            return Some(pointer.to_string());
+        }
+    }
+    None
+}
+
+fn parse_ioctl_stack_args(output: &str) -> Option<IoctlStackArgsSummary> {
+    for line in output.lines() {
+        let Some((_, args)) = line.split_once("Args:") else {
+            continue;
+        };
+        let raw_values: Vec<String> = args
+            .split_whitespace()
+            .take(4)
+            .map(|value| value.trim().to_string())
+            .collect();
+        if raw_values.len() < 4 {
+            continue;
+        }
+        return Some(IoctlStackArgsSummary {
+            output_buffer_length: parse_debugger_u64(&raw_values[0])?,
+            input_buffer_length: parse_debugger_u64(&raw_values[1])?,
+            ioctl_code: parse_debugger_u64(&raw_values[2])?,
+            type3_input_buffer: parse_debugger_u64(&raw_values[3])?,
+            raw_values,
+        });
+    }
+    None
+}
+
+fn parse_db_bytes(output: &str, max_bytes: usize) -> Vec<String> {
+    let mut bytes = Vec::new();
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        let _address = parts.next();
+        for token in parts {
+            for value in token.split('-') {
+                if value.len() == 2 && value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                    bytes.push(value.to_ascii_lowercase());
+                    if bytes.len() >= max_bytes {
+                        return bytes;
+                    }
+                }
+            }
+        }
+    }
+    bytes
 }
 
 fn build_breakpoint_command(
@@ -1094,6 +1204,15 @@ impl WindbgMcpServer {
         .with_title("Driver dispatch snapshot")
     }
 
+    fn ioctl_snapshot_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_ioctl_snapshot",
+            "Collect an IOCTL-focused IRP snapshot with auto IRP-register detection, parsed IOCTL/input/output lengths, SystemBuffer byte summary, IRP memory, registers, backtrace, and current disassembly.",
+            schema_for_type::<IoctlSnapshotArgs>(),
+        )
+        .with_title("IOCTL snapshot")
+    }
+
     fn interrupt_tool(&self) -> Tool {
         Tool::new(
             "windbg_interrupt_target",
@@ -1222,6 +1341,7 @@ impl WindbgMcpServer {
             self.driver_summary_tool(),
             self.set_driver_dispatch_breakpoints_tool(),
             self.driver_dispatch_snapshot_tool(),
+            self.ioctl_snapshot_tool(),
             self.search_tool(),
             self.interrupt_tool(),
             self.resume_tool(),
@@ -1793,9 +1913,13 @@ impl WindbgMcpServer {
     async fn read_registers(&self, args: ReadRegistersArgs) -> Result<Value, McpError> {
         let command = match args.registers {
             Some(registers) => {
-                let registers: Vec<String> = registers
+                let registers: Result<Vec<String>, String> = registers
                     .into_iter()
-                    .map(|value| value.trim().to_string())
+                    .map(|value| debugger_atom(&value, "register"))
+                    .collect();
+                let registers: Vec<String> = registers
+                    .map_err(|error| McpError::invalid_params(error, None))?
+                    .into_iter()
                     .filter(|value| !value.is_empty())
                     .collect();
                 if registers.is_empty() {
@@ -1816,14 +1940,10 @@ impl WindbgMcpServer {
     }
 
     async fn write_register(&self, args: WriteRegisterArgs) -> Result<Value, McpError> {
-        let register = args.register.trim();
-        let value = args.value.trim();
-        if register.is_empty() || value.is_empty() {
-            return Err(McpError::invalid_params(
-                "register and value cannot be empty",
-                None,
-            ));
-        }
+        let register = debugger_atom(&args.register, "register")
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        let value = debugger_atom(&args.value, "value")
+            .map_err(|error| McpError::invalid_params(error, None))?;
 
         self.execute_command(
             args.session_id.as_deref(),
@@ -2324,6 +2444,172 @@ impl WindbgMcpServer {
         }))
     }
 
+    async fn detect_ioctl_irp(
+        &self,
+        session_id: Option<&str>,
+        candidates: &[String],
+    ) -> (Option<String>, Option<String>, Vec<Value>) {
+        let mut steps = Vec::new();
+        for candidate in candidates {
+            let command = format!("!irp {candidate}");
+            let (step, output) = self.diagnostic_command_step(session_id, &command).await;
+            let valid = irp_output_looks_valid(&output);
+            let system_buffer = parse_irp_system_buffer(&output);
+            steps.push(json!({
+                "candidate": candidate,
+                "valid": valid,
+                "system_buffer": system_buffer,
+                "probe": step,
+            }));
+            if valid {
+                return (Some(candidate.clone()), system_buffer, steps);
+            }
+        }
+        (None, None, steps)
+    }
+
+    async fn ioctl_snapshot(&self, args: IoctlSnapshotArgs) -> Result<Value, McpError> {
+        let mut detection_steps = Vec::new();
+        let auto_detect = args.auto_detect.unwrap_or(true);
+        let provided_irp = trimmed_nonempty(args.irp.as_deref()).is_some();
+        let mut auto_detected_system_buffer = None;
+        let mut irp = match trimmed_nonempty(args.irp.as_deref()) {
+            Some(value) => debugger_atom(value, "irp")
+                .map_err(|error| McpError::invalid_params(error, None))?,
+            None => "@rdx".to_string(),
+        };
+
+        let candidates: Vec<String> = match args.candidate_irps {
+            Some(values) => values
+                .into_iter()
+                .map(|value| debugger_atom(&value, "candidate_irps"))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| McpError::invalid_params(error, None))?,
+            None => ["@rdx", "@r15", "@rsi", "@rbx", "@rdi", "@rcx", "@r8", "@r9"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        };
+
+        let selection_source = if provided_irp {
+            "argument"
+        } else if auto_detect {
+            let (detected_irp, detected_system_buffer, steps) = self
+                .detect_ioctl_irp(args.session_id.as_deref(), &candidates)
+                .await;
+            detection_steps = steps;
+            if let Some(detected_irp) = detected_irp {
+                irp = detected_irp;
+                auto_detected_system_buffer = detected_system_buffer;
+                "auto_detect"
+            } else {
+                "default"
+            }
+        } else {
+            "default"
+        };
+        let stack_location = match trimmed_nonempty(args.stack_location.as_deref()) {
+            Some(value) => debugger_atom(value, "stack_location")
+                .map_err(|error| McpError::invalid_params(error, None))?,
+            None => format!("poi({irp}+b8)"),
+        };
+        let detected_system_buffer = auto_detected_system_buffer.is_some();
+        let system_buffer = match trimmed_nonempty(args.system_buffer.as_deref()) {
+            Some(value) => debugger_atom(value, "system_buffer")
+                .map_err(|error| McpError::invalid_params(error, None))?,
+            None => auto_detected_system_buffer.unwrap_or_else(|| format!("poi({irp}+18)")),
+        };
+        let system_buffer_source = if trimmed_nonempty(args.system_buffer.as_deref()).is_some() {
+            "argument"
+        } else if detected_system_buffer {
+            "auto_detect_irp_output"
+        } else {
+            "irp_associated_system_buffer"
+        };
+        let buffer_count = clamp_count(args.buffer_count, 0x84, 0x1000);
+        let irp_memory_count = clamp_count(args.irp_memory_count, 0x30, 0x200);
+        let stack_count = clamp_count(args.stack_count, 16, 128);
+        let buffer_dwords = buffer_count.div_ceil(4);
+        let buffer_qwords = buffer_count.div_ceil(8);
+        let irp_command = format!("!irp {irp}");
+        let stack_args_command = format!("dd {stack_location}+8 L5");
+        let system_buffer_bytes_command = format!("db {system_buffer} L{buffer_count}");
+
+        let commands = vec![
+            ".lastevent".to_string(),
+            "r".to_string(),
+            "u @rip L16".to_string(),
+            format!("kv {stack_count}"),
+            irp_command.clone(),
+            format!("dt nt!_IRP {irp}"),
+            format!("dq {irp} L{irp_memory_count}"),
+            format!("dq {stack_location} L8"),
+            stack_args_command.clone(),
+            format!("? poi({stack_location}+18)"),
+            format!("? poi({stack_location}+10)"),
+            format!("? poi({stack_location}+8)"),
+            system_buffer_bytes_command.clone(),
+            format!("dd {system_buffer} L{buffer_dwords}"),
+            format!("dq {system_buffer} L{buffer_qwords}"),
+            "bl".to_string(),
+        ];
+
+        let mut steps = Vec::new();
+        let mut irp_output = String::new();
+        let mut stack_args_output = String::new();
+        let mut system_buffer_bytes_output = String::new();
+        for command in commands {
+            let (step, _) = self
+                .diagnostic_command_step(args.session_id.as_deref(), &command)
+                .await;
+            if command == irp_command {
+                irp_output = step["output"].as_str().unwrap_or_default().to_string();
+            }
+            if command == stack_args_command {
+                stack_args_output = step["output"].as_str().unwrap_or_default().to_string();
+            }
+            if command == system_buffer_bytes_command {
+                system_buffer_bytes_output =
+                    step["output"].as_str().unwrap_or_default().to_string();
+            }
+            steps.push(step);
+        }
+        let ioctl_args = parse_ioctl_stack_args(&irp_output);
+        let system_buffer_first_bytes = parse_db_bytes(&system_buffer_bytes_output, 32);
+        let system_buffer_first_hex = if system_buffer_first_bytes.is_empty() {
+            None
+        } else {
+            Some(system_buffer_first_bytes.join(""))
+        };
+
+        Ok(json!({
+            "irp": irp,
+            "stack_location": stack_location,
+            "system_buffer": system_buffer,
+            "selection_source": selection_source,
+            "system_buffer_source": system_buffer_source,
+            "buffer_count": buffer_count,
+            "auto_detect": {
+                "enabled": auto_detect,
+                "candidates": candidates,
+                "steps": detection_steps,
+            },
+            "summary": {
+                "irp_valid": irp_output_looks_valid(&irp_output),
+                "ioctl": ioctl_args,
+                "system_buffer_from_irp": parse_irp_system_buffer(&irp_output),
+                "system_buffer_first_bytes": system_buffer_first_bytes,
+                "system_buffer_first_hex": system_buffer_first_hex,
+                "stack_args_output": stack_args_output,
+            },
+            "steps": steps,
+            "notes": [
+                "When `irp` is omitted, the tool probes common IRP-holding registers and falls back to @rdx.",
+                "For unusual breakpoints, pass irp/system_buffer/stack_location explicitly.",
+            ],
+        }))
+    }
+
     async fn query_state(&self, session_id: Option<&str>) -> Result<Value, McpError> {
         let state = match &self.backend {
             ServerBackend::AttachedSession { dispatcher } => dispatcher
@@ -2437,7 +2723,7 @@ impl WindbgMcpServer {
 impl ServerHandler for WindbgMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.is_headless() {
-            "Open a session with `windbg_open_session` before using debugger actions. Use `windbg_set_breakpoint`, `windbg_find_process`, `windbg_set_process_breakpoint`, `windbg_set_syscall_breakpoint`, `windbg_set_driver_load_breakpoint`, `windbg_driver_summary`, `windbg_set_driver_dispatch_breakpoints`, `windbg_driver_dispatch_snapshot`, `windbg_continue_until_break`, `windbg_breakpoint_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common reverse-engineering and kernel-driver flows. Use `windbg_execute_command` for raw WinDbg commands, `windbg_get_output` with cursors for buffered output, and `windbg_resume_target` to continue a live target without blocking on raw `g`. Use `windbg_recover_session` if a live KDNET target may have been left broken. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
+            "Open a session with `windbg_open_session` before using debugger actions. Use `windbg_set_breakpoint`, `windbg_find_process`, `windbg_set_process_breakpoint`, `windbg_set_syscall_breakpoint`, `windbg_set_driver_load_breakpoint`, `windbg_driver_summary`, `windbg_set_driver_dispatch_breakpoints`, `windbg_driver_dispatch_snapshot`, `windbg_ioctl_snapshot`, `windbg_continue_until_break`, `windbg_breakpoint_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common reverse-engineering and kernel-driver flows. Use `windbg_execute_command` for raw WinDbg commands, `windbg_get_output` with cursors for buffered output, and `windbg_resume_target` to continue a live target without blocking on raw `g`. Use `windbg_recover_session` if a live KDNET target may have been left broken. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
         } else {
             "This server is organized around low-context resources plus a small toolset. Start with `windbg_search_catalog`, read `windbg://command/{id}`, optionally escalate to `windbg://command-full/{id}`, then call `windbg_get_execution_state`. If the debugger is running or busy, call `windbg_interrupt_target` and verify state again before calling `windbg_execute_command`. Use `windbg_get_output` to read buffered command output again later, and `windbg_resume_target` to continue execution without issuing a raw `g` command."
         };
@@ -2496,6 +2782,7 @@ impl ServerHandler for WindbgMcpServer {
                 Some(self.set_driver_dispatch_breakpoints_tool())
             }
             "windbg_driver_dispatch_snapshot" => Some(self.driver_dispatch_snapshot_tool()),
+            "windbg_ioctl_snapshot" => Some(self.ioctl_snapshot_tool()),
             "windbg_search_catalog" => Some(self.search_tool()),
             "windbg_interrupt_target" => Some(self.interrupt_tool()),
             "windbg_resume_target" => Some(self.resume_tool()),
@@ -2648,6 +2935,11 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_driver_dispatch_snapshot" => {
                 let args: DriverDispatchSnapshotArgs = self.parse_arguments(request.arguments)?;
                 let payload = self.driver_dispatch_snapshot(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_ioctl_snapshot" => {
+                let args: IoctlSnapshotArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.ioctl_snapshot(args).await?;
                 Ok(CallToolResult::structured(payload))
             }
             "windbg_search_catalog" => {
@@ -2989,6 +3281,7 @@ mod tests {
             "windbg_driver_summary",
             "windbg_set_driver_dispatch_breakpoints",
             "windbg_driver_dispatch_snapshot",
+            "windbg_ioctl_snapshot",
         ] {
             let tool = server
                 .get_tool(name)
@@ -3094,6 +3387,47 @@ Dispatch routines:
         assert!(is_default_dispatch_routine(&routines[1]));
         assert!(dispatch_filter_matches(&routines[2], "device_control"));
         assert!(dispatch_filter_matches(&routines[2], "0e"));
+    }
+
+    #[test]
+    fn parses_ioctl_snapshot_summary_from_irp_output() {
+        let output = r#"
+Irp is active with 1 stacks 1 is current (= 0xffffda8acabffb60)
+ No Mdl: System buffer=ffffda8acab17140: Thread ffffda8ac8bf0080:  Irp stack trace.
+     cmd  flg cl Device   File     Completion-Context
+>[IRP_MJ_DEVICE_CONTROL(e), N/A(0)]
+            5  0 ffffda8ac8586e10 ffffda8acb76bd70 00000000-00000000
+           \Driver\ShadowGate
+            Args: 00000084 0000000c 0x80012004 00000000
+"#;
+
+        assert!(irp_output_looks_valid(output));
+        assert_eq!(
+            parse_irp_system_buffer(output).as_deref(),
+            Some("ffffda8acab17140")
+        );
+        let args = parse_ioctl_stack_args(output).expect("IOCTL args should parse");
+        assert_eq!(args.output_buffer_length, 0x84);
+        assert_eq!(args.input_buffer_length, 0x0c);
+        assert_eq!(args.ioctl_code, 0x80012004);
+        assert_eq!(args.type3_input_buffer, 0);
+    }
+
+    #[test]
+    fn parses_db_byte_prefix_for_system_buffer_summary() {
+        let output = r#"
+ffffda8a`cab17140  52 00 00 00 00 00 00 00-65 13 ad de 00 00 00 00  R.......e.......
+ffffda8a`cab17150  ff ee                                      ..
+"#;
+
+        let bytes = parse_db_bytes(output, 18);
+        assert_eq!(
+            bytes,
+            vec![
+                "52", "00", "00", "00", "00", "00", "00", "00", "65", "13", "ad", "de", "00", "00",
+                "00", "00", "ff", "ee"
+            ]
+        );
     }
 
     #[test]
