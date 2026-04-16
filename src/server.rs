@@ -72,6 +72,17 @@ struct DiagnoseExtensionsArgs {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+struct DbgPrintArgs {
+    session_id: Option<String>,
+    lines: Option<u32>,
+    include_raw_output: Option<bool>,
+    load_extension: Option<bool>,
+    prepare_symbols: Option<bool>,
+    symbol_cache: Option<String>,
+    symbol_server: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 struct ListBreakpointsArgs {
     session_id: Option<String>,
 }
@@ -84,6 +95,24 @@ struct SetBreakpointArgs {
     one_shot: Option<bool>,
     pass_count: Option<u32>,
     command: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetHardwareBreakpointArgs {
+    session_id: Option<String>,
+    address: String,
+    access: Option<String>,
+    size: Option<u32>,
+    one_shot: Option<bool>,
+    pass_count: Option<u32>,
+    command: Option<String>,
+    process_name: Option<String>,
+    pid: Option<String>,
+    eprocess: Option<String>,
+    ethread: Option<String>,
+    prepare_symbols: Option<bool>,
+    match_index: Option<usize>,
+    set_context: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -108,6 +137,8 @@ struct SetProcessBreakpointArgs {
     command: Option<String>,
     prepare_symbols: Option<bool>,
     match_index: Option<usize>,
+    set_context: Option<bool>,
+    allow_user_software: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -127,6 +158,7 @@ struct SetSyscallBreakpointArgs {
 struct ClearBreakpointArgs {
     session_id: Option<String>,
     breakpoint: Option<String>,
+    safe: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -182,11 +214,48 @@ struct BreakpointSnapshotArgs {
     memory: Option<Vec<SnapshotMemoryArgs>>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TraceBreakpointArgs {
+    session_id: Option<String>,
+    location: String,
+    kind: Option<String>,
+    hardware: Option<bool>,
+    access: Option<String>,
+    size: Option<u32>,
+    process_name: Option<String>,
+    pid: Option<String>,
+    eprocess: Option<String>,
+    ethread: Option<String>,
+    prepare_symbols: Option<bool>,
+    match_index: Option<usize>,
+    set_context: Option<bool>,
+    hits: Option<u32>,
+    timeout_secs: Option<u64>,
+    poll_interval_millis: Option<u64>,
+    settle_millis: Option<u64>,
+    require_stable_break: Option<bool>,
+    commands: Option<Vec<String>>,
+    include_default_snapshot: Option<bool>,
+    auto_resume: Option<bool>,
+    clear_after: Option<bool>,
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct ContinueUntilBreakArgs {
     session_id: Option<String>,
     timeout_secs: Option<u64>,
     poll_interval_millis: Option<u64>,
+    settle_millis: Option<u64>,
+    require_stable_break: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct StepExecutionArgs {
+    session_id: Option<String>,
+    timeout_secs: Option<u64>,
+    poll_interval_millis: Option<u64>,
+    settle_millis: Option<u64>,
+    require_stable_break: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -265,6 +334,20 @@ struct IoctlSnapshotArgs {
     buffer_count: Option<u32>,
     irp_memory_count: Option<u32>,
     stack_count: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct MinifilterMessageSnapshotArgs {
+    session_id: Option<String>,
+    input_buffer: Option<String>,
+    input_length: Option<String>,
+    output_buffer: Option<String>,
+    output_length: Option<String>,
+    return_length_ptr: Option<String>,
+    input_count: Option<u32>,
+    output_count: Option<u32>,
+    stack_count: Option<u32>,
+    backtrace_count: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -401,6 +484,15 @@ fn output_indicates_symbol_problem(output: &str) -> bool {
         || (lower.contains("cannot find") && lower.contains("type"))
 }
 
+fn output_indicates_extension_problem(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("unable to load extension")
+        || lower.contains("could not load")
+        || lower.contains("failed to load")
+        || lower.contains("no export")
+        || lower.contains("extension dll")
+}
+
 fn chain_contains_extension(chain_output: &str, extension: &str) -> bool {
     let chain = chain_output.to_ascii_lowercase();
     let extension = extension
@@ -410,6 +502,21 @@ fn chain_contains_extension(chain_output: &str, extension: &str) -> bool {
         .to_ascii_lowercase();
     !extension.is_empty()
         && (chain.contains(&extension) || chain.contains(&format!("{extension}.dll")))
+}
+
+fn tail_output_lines(output: &str, limit: u32) -> (Vec<String>, usize, bool) {
+    let lines: Vec<String> = output
+        .lines()
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .collect();
+    let total = lines.len();
+    let limit = limit.max(1) as usize;
+    let truncated = total > limit;
+    if truncated {
+        (lines[total - limit..].to_vec(), total, true)
+    } else {
+        (lines, total, false)
+    }
 }
 
 fn quote_debugger_command(command: &str) -> String {
@@ -528,6 +635,89 @@ fn parse_db_bytes(output: &str, max_bytes: usize) -> Vec<String> {
     bytes
 }
 
+fn parse_le_u32_from_hex_bytes(bytes: &[String], offset: usize) -> Option<u32> {
+    let window = bytes.get(offset..offset + 4)?;
+    let mut value = 0u32;
+    for (index, byte) in window.iter().enumerate() {
+        let parsed = u8::from_str_radix(byte, 16).ok()? as u32;
+        value |= parsed << (index * 8);
+    }
+    Some(value)
+}
+
+fn contiguous_hex(bytes: &[String]) -> Option<String> {
+    (!bytes.is_empty()).then(|| bytes.join(""))
+}
+
+fn parse_evaluator_u64(output: &str) -> Option<u64> {
+    for line in output.lines().rev() {
+        let value_text = line
+            .split_once('=')
+            .map(|(_, value)| value)
+            .unwrap_or(line)
+            .trim();
+        for token in value_text.split_whitespace().rev() {
+            let token = token.trim_matches(|ch: char| ch == ',' || ch == ';');
+            if let Some(value) = parse_debugger_u64(token) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn blocked_unsafe_debugger_command(command: &str) -> Option<String> {
+    for segment in command.split([';', '\n', '\r']) {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        if disables_load_event_filter(segment) {
+            return Some(format!(
+                "blocked unsafe WinDbg command `{segment}`: this dbgeng headless path has been observed to access-violate when disabling `ld` filters after a module-load event. Leave the load filter in the short-lived session, clear normal breakpoints with `windbg_clear_breakpoint`, then resume or close the session."
+            ));
+        }
+        if looks_like_fragile_multi_register_read(segment) {
+            return Some(format!(
+                "blocked fragile WinDbg command `{segment}`: raw `r <reg> <reg> ...` subset reads have produced transient dbgeng `0x80040205` states in headless mode. Use `windbg_read_registers` with a `registers` array instead; it reads each register as an isolated command."
+            ));
+        }
+    }
+    None
+}
+
+fn looks_like_fragile_multi_register_read(segment: &str) -> bool {
+    let mut parts = segment.split_whitespace();
+    let Some(verb) = parts.next() else {
+        return false;
+    };
+    if !verb.eq_ignore_ascii_case("r") {
+        return false;
+    }
+
+    let registers = parts.collect::<Vec<_>>();
+    registers.len() > 1 && registers.iter().all(|part| !part.contains('='))
+}
+
+fn disables_load_event_filter(segment: &str) -> bool {
+    let mut parts = segment.split_whitespace();
+    let Some(verb) = parts.next() else {
+        return false;
+    };
+    if !verb.eq_ignore_ascii_case("sxd") {
+        return false;
+    }
+    let Some(filter_spec) = parts.next() else {
+        return false;
+    };
+    let filter_name = filter_spec
+        .split_once(':')
+        .map(|(name, _)| name)
+        .unwrap_or(filter_spec)
+        .to_ascii_lowercase();
+    matches!(filter_name.as_str(), "ld" | "ld*")
+}
+
 fn build_breakpoint_command(
     kind: Option<&str>,
     location: &str,
@@ -575,6 +765,148 @@ fn build_breakpoint_command(
     }
 
     Ok(command)
+}
+
+fn normalize_hardware_access(access: Option<&str>) -> Result<&'static str, String> {
+    let access = access
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("execute")
+        .to_ascii_lowercase();
+
+    match access.as_str() {
+        "e" | "exec" | "execute" | "execution" => Ok("e"),
+        "r" | "read" => Ok("r"),
+        "w" | "write" => Ok("w"),
+        "i" | "io" | "i/o" => Ok("i"),
+        _ => Err(
+            "hardware breakpoint access must be execute/e, read/r, write/w, or io/i".to_string(),
+        ),
+    }
+}
+
+fn normalize_hardware_size(access: &str, size: Option<u32>) -> Result<u32, String> {
+    let size = size.unwrap_or(1);
+    if !matches!(size, 1 | 2 | 4 | 8) {
+        return Err("hardware breakpoint size must be 1, 2, 4, or 8 bytes".to_string());
+    }
+    if access == "e" && size != 1 {
+        return Err("execute hardware breakpoints must use size 1".to_string());
+    }
+    Ok(size)
+}
+
+fn build_hardware_breakpoint_command(
+    access: Option<&str>,
+    size: Option<u32>,
+    address: &str,
+    one_shot: Option<bool>,
+    process: Option<&str>,
+    thread: Option<&str>,
+    pass_count: Option<u32>,
+    command_string: Option<&str>,
+) -> Result<String, String> {
+    let access = normalize_hardware_access(access)?;
+    let size = normalize_hardware_size(access, size)?;
+    let address = debugger_atom(address, "address")?;
+
+    let mut command = format!("ba {access} {size}");
+    if one_shot.unwrap_or(false) {
+        command.push_str(" /1");
+    }
+    if let Some(process) = trimmed_nonempty(process) {
+        command.push_str(" /p ");
+        command.push_str(&debugger_atom(process, "eprocess")?);
+    }
+    if let Some(thread) = trimmed_nonempty(thread) {
+        command.push_str(" /t ");
+        command.push_str(&debugger_atom(thread, "ethread")?);
+    }
+    command.push(' ');
+    command.push_str(&address);
+    if let Some(pass_count) = pass_count {
+        command.push(' ');
+        command.push_str(&pass_count.to_string());
+    }
+    if let Some(command_string) = trimmed_nonempty(command_string) {
+        command.push(' ');
+        command.push_str(&quote_debugger_command(command_string));
+    }
+
+    Ok(command)
+}
+
+fn parse_breakpoint_ids(output: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for line in output.lines() {
+        let Some(token) = line.split_whitespace().next() else {
+            continue;
+        };
+        let token = token.trim_end_matches(':');
+        if !token.is_empty()
+            && token.chars().all(|ch| ch.is_ascii_digit())
+            && !ids.iter().any(|existing| existing == token)
+        {
+            ids.push(token.to_string());
+        }
+    }
+    ids
+}
+
+fn new_breakpoint_ids(before: &str, after: &str) -> Vec<String> {
+    let before_ids = parse_breakpoint_ids(before);
+    parse_breakpoint_ids(after)
+        .into_iter()
+        .filter(|id| !before_ids.iter().any(|before_id| before_id == id))
+        .collect()
+}
+
+fn output_indicates_breakpoint_failure(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("couldn't resolve error")
+        || lower.contains("could not resolve")
+        || lower.contains("unable to resolve")
+        || lower.contains("symbol not found")
+        || lower.contains("syntax error")
+        || lower.contains("breakpoint expression")
+        || lower.contains("ambiguous symbol")
+}
+
+fn validate_created_breakpoints(
+    command: &str,
+    output: &str,
+    created_breakpoints: &[String],
+) -> Result<(), String> {
+    if output_indicates_breakpoint_failure(output) {
+        return Err(format!(
+            "breakpoint command `{command}` failed in WinDbg: {}",
+            output.trim()
+        ));
+    }
+    if created_breakpoints.is_empty() {
+        return Err(format!(
+            "breakpoint command `{command}` did not create a new breakpoint; verify the address/symbol and inspect `bl` output"
+        ));
+    }
+    Ok(())
+}
+
+fn looks_like_user_mode_address(value: &str) -> bool {
+    let value = value.trim().trim_start_matches('@');
+    let Some(address) = parse_debugger_u64(value) else {
+        return false;
+    };
+    address != 0 && address < 0x0000_8000_0000_0000
+}
+
+fn default_trace_commands() -> Vec<String> {
+    vec![
+        ".lastevent".to_string(),
+        "r".to_string(),
+        "u @rip L16".to_string(),
+        "kv 16".to_string(),
+        "bl".to_string(),
+    ]
 }
 
 fn memory_command(
@@ -1015,6 +1347,15 @@ impl WindbgMcpServer {
         .with_title("Diagnose debugger extensions")
     }
 
+    fn dbgprint_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_dbgprint",
+            "Read kernel DbgPrint output with the `!dbgprint` extension command. Returns a bounded tail by default, with optional `kdexts` loading, symbol preparation, and full raw output.",
+            schema_for_type::<DbgPrintArgs>(),
+        )
+        .with_title("Read DbgPrint output")
+    }
+
     fn set_breakpoint_tool(&self) -> Tool {
         Tool::new(
             "windbg_set_breakpoint",
@@ -1024,10 +1365,19 @@ impl WindbgMcpServer {
         .with_title("Set breakpoint")
     }
 
+    fn set_hardware_breakpoint_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_set_hardware_breakpoint",
+            "Set a hardware breakpoint/watchpoint with WinDbg `ba`. Supports execute/read/write/io access, byte sizes 1/2/4/8, one-shot/pass-count/command strings, and optional process/thread scoping.",
+            schema_for_type::<SetHardwareBreakpointArgs>(),
+        )
+        .with_title("Set hardware breakpoint")
+    }
+
     fn find_process_tool(&self) -> Tool {
         Tool::new(
             "windbg_find_process",
-            "Find kernel processes with `!process`, returning parsed EPROCESS, PID, image name, and raw summary blocks. Use this before process-scoped kernel breakpoints.",
+            "Find kernel processes with `!process`, returning parsed EPROCESS, PID, image name, and raw summary blocks. Prepares `nt` symbols by default so process lookup keeps working after fresh KDNET attaches.",
             schema_for_type::<FindProcessArgs>(),
         )
         .with_title("Find kernel process")
@@ -1123,6 +1473,15 @@ impl WindbgMcpServer {
         .with_title("Breakpoint snapshot")
     }
 
+    fn trace_breakpoint_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_trace_breakpoint",
+            "Set a temporary software or hardware breakpoint, continue until stable hit(s), run synchronous capture commands, then optionally clear and resume. This replaces fragile command-breakpoint tracing such as `bp addr \".echo; r; g\"` in headless mode.",
+            schema_for_type::<TraceBreakpointArgs>(),
+        )
+        .with_title("Trace breakpoint")
+    }
+
     fn continue_until_break_tool(&self) -> Tool {
         Tool::new(
             "windbg_continue_until_break",
@@ -1130,6 +1489,33 @@ impl WindbgMcpServer {
             schema_for_type::<ContinueUntilBreakArgs>(),
         )
         .with_title("Continue until break")
+    }
+
+    fn step_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_step",
+            "Single-step into one instruction with `t`, then poll until a stable command-ready break is available.",
+            schema_for_type::<StepExecutionArgs>(),
+        )
+        .with_title("Step into")
+    }
+
+    fn step_over_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_step_over",
+            "Step over one instruction/call with `p`, then poll until a stable command-ready break is available.",
+            schema_for_type::<StepExecutionArgs>(),
+        )
+        .with_title("Step over")
+    }
+
+    fn go_up_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_go_up",
+            "Run until the current function returns with `gu`, then poll until a stable command-ready break is available.",
+            schema_for_type::<StepExecutionArgs>(),
+        )
+        .with_title("Go up")
     }
 
     fn evaluate_expression_tool(&self) -> Tool {
@@ -1211,6 +1597,15 @@ impl WindbgMcpServer {
             schema_for_type::<IoctlSnapshotArgs>(),
         )
         .with_title("IOCTL snapshot")
+    }
+
+    fn minifilter_message_snapshot_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_minifilter_message_snapshot",
+            "Collect a Filter Manager communication-port MessageNotifyCallback snapshot: registers, stack arguments, input/output buffer bytes, parsed message header, backtrace, disassembly, and breakpoint list. Defaults match x64 minifilter callbacks where InputBuffer is @rdx and InputBufferLength is @r8.",
+            schema_for_type::<MinifilterMessageSnapshotArgs>(),
+        )
+        .with_title("Minifilter message snapshot")
     }
 
     fn interrupt_tool(&self) -> Tool {
@@ -1320,7 +1715,9 @@ impl WindbgMcpServer {
             self.output_tool(),
             self.prepare_symbols_tool(),
             self.diagnose_extensions_tool(),
+            self.dbgprint_tool(),
             self.set_breakpoint_tool(),
+            self.set_hardware_breakpoint_tool(),
             self.find_process_tool(),
             self.set_process_breakpoint_tool(),
             self.set_syscall_breakpoint_tool(),
@@ -1332,7 +1729,11 @@ impl WindbgMcpServer {
             self.disassemble_tool(),
             self.backtrace_tool(),
             self.breakpoint_snapshot_tool(),
+            self.trace_breakpoint_tool(),
             self.continue_until_break_tool(),
+            self.step_tool(),
+            self.step_over_tool(),
+            self.go_up_tool(),
             self.evaluate_expression_tool(),
             self.list_modules_tool(),
             self.search_symbols_tool(),
@@ -1342,6 +1743,7 @@ impl WindbgMcpServer {
             self.set_driver_dispatch_breakpoints_tool(),
             self.driver_dispatch_snapshot_tool(),
             self.ioctl_snapshot_tool(),
+            self.minifilter_message_snapshot_tool(),
             self.search_tool(),
             self.interrupt_tool(),
             self.resume_tool(),
@@ -1389,6 +1791,10 @@ impl WindbgMcpServer {
         session_id: Option<&str>,
         command: String,
     ) -> Result<CommandExecutionResult, McpError> {
+        if let Some(message) = blocked_unsafe_debugger_command(&command) {
+            return Err(McpError::invalid_params(message, None));
+        }
+
         let execution = match &self.backend {
             ServerBackend::AttachedSession { dispatcher } => dispatcher
                 .execute(command.clone())
@@ -1656,6 +2062,114 @@ impl WindbgMcpServer {
         }))
     }
 
+    async fn dbgprint(&self, args: DbgPrintArgs) -> Result<Value, McpError> {
+        let line_limit = clamp_count(args.lines, 200, 5000);
+        let mut steps = Vec::new();
+        let mut recommendations = Vec::new();
+        let mut symbol_status = "not_checked".to_string();
+        let mut load_output = String::new();
+
+        if args.prepare_symbols.unwrap_or(false) {
+            match self
+                .prepare_symbols(PrepareSymbolsArgs {
+                    session_id: args.session_id.clone(),
+                    module: Some("nt".to_string()),
+                    symbol_cache: args.symbol_cache.clone(),
+                    symbol_server: args.symbol_server.clone(),
+                    force_mismatched: None,
+                })
+                .await
+            {
+                Ok(payload) => {
+                    symbol_status = payload["symbol_status"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_string();
+                    steps.push(json!({
+                        "tool": "windbg_prepare_symbols",
+                        "result": payload,
+                    }));
+                }
+                Err(error) => {
+                    symbol_status = "prepare_failed".to_string();
+                    recommendations.push(
+                        "`windbg_prepare_symbols` failed while preparing `nt`; inspect symbol cache and symbol-server reachability.".to_string(),
+                    );
+                    steps.push(json!({
+                        "tool": "windbg_prepare_symbols",
+                        "error": format!("{error:?}"),
+                    }));
+                }
+            }
+        }
+
+        if args.load_extension.unwrap_or(true) {
+            let (load_step, output) = self
+                .diagnostic_command_step(args.session_id.as_deref(), ".load kdexts")
+                .await;
+            load_output = output;
+            steps.push(load_step);
+        }
+
+        let execution = self
+            .execute_debugger_command(args.session_id.as_deref(), "!dbgprint".to_string())
+            .await?;
+        let raw_output = execution.output.clone();
+        let (lines, line_count, truncated) = tail_output_lines(&raw_output, line_limit);
+        let output = lines.join("\n");
+        let symbol_problem = output_indicates_symbol_problem(&raw_output)
+            || output_indicates_symbol_problem(&load_output);
+        let extension_problem = output_indicates_extension_problem(&raw_output)
+            || output_indicates_extension_problem(&load_output);
+
+        if extension_problem {
+            recommendations.push(
+                "`!dbgprint` or `.load kdexts` reported an extension-loading problem; call `windbg_diagnose_extensions` or retry with `load_extension:true`.".to_string(),
+            );
+        }
+        if symbol_problem {
+            recommendations.push(
+                "`!dbgprint` reported a symbol problem; retry with `prepare_symbols:true` or call `windbg_prepare_symbols {\"module\":\"nt\"}` first.".to_string(),
+            );
+        }
+        if raw_output.trim().is_empty() {
+            recommendations.push(
+                "`!dbgprint` returned no text. The kernel DbgPrint buffer may be empty, filtered by component masks, or the target may not have emitted DbgPrint output yet.".to_string(),
+            );
+        }
+        if recommendations.is_empty() {
+            recommendations.push(
+                "`!dbgprint` completed without obvious extension or symbol errors.".to_string(),
+            );
+        }
+
+        let mut payload = json!({
+            "command": execution.command,
+            "source": "!dbgprint",
+            "line_limit": line_limit,
+            "line_count": line_count,
+            "returned_line_count": lines.len(),
+            "truncated": truncated,
+            "lines": lines,
+            "output": output,
+            "state_before": execution.state_before,
+            "state_after": execution.state_after,
+            "symbol_status": symbol_status,
+            "symbol_problem": symbol_problem,
+            "extension_problem": extension_problem,
+            "recommendations": recommendations,
+            "steps": steps,
+        });
+
+        if args.include_raw_output.unwrap_or(false) {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("raw_output".to_string(), json!(raw_output));
+            }
+        }
+
+        Ok(payload)
+    }
+
     async fn set_breakpoint(&self, args: SetBreakpointArgs) -> Result<Value, McpError> {
         let command = build_breakpoint_command(
             args.kind.as_deref(),
@@ -1668,15 +2182,124 @@ impl WindbgMcpServer {
         )
         .map_err(|error| McpError::invalid_params(error, None))?;
 
+        let before_list = self
+            .execute_debugger_command(args.session_id.as_deref(), "bl".to_string())
+            .await?;
+        let before_output = before_list.output.clone();
         let set = self
             .execute_debugger_command(args.session_id.as_deref(), command)
             .await?;
         let list = self
             .execute_debugger_command(args.session_id.as_deref(), "bl".to_string())
             .await?;
+        let created_breakpoints = new_breakpoint_ids(&before_output, &list.output);
+        validate_created_breakpoints(&set.command, &set.output, &created_breakpoints)
+            .map_err(|error| McpError::invalid_params(error, None))?;
 
         Ok(json!({
+            "breakpoints_before": render_execution_result(before_list),
+            "created_breakpoints": created_breakpoints,
             "breakpoint": render_execution_result(set),
+            "breakpoints": render_execution_result(list),
+        }))
+    }
+
+    async fn set_hardware_breakpoint(
+        &self,
+        args: SetHardwareBreakpointArgs,
+    ) -> Result<Value, McpError> {
+        let has_process_selector = trimmed_nonempty(args.eprocess.as_deref()).is_some()
+            || trimmed_nonempty(args.process_name.as_deref()).is_some()
+            || trimmed_nonempty(args.pid.as_deref()).is_some();
+        let (mut steps, process, candidates) = if has_process_selector {
+            let selector = SetProcessBreakpointArgs {
+                session_id: args.session_id.clone(),
+                location: args.address.clone(),
+                process_name: args.process_name.clone(),
+                pid: args.pid.clone(),
+                eprocess: args.eprocess.clone(),
+                ethread: args.ethread.clone(),
+                kind: None,
+                one_shot: args.one_shot,
+                pass_count: args.pass_count,
+                command: args.command.clone(),
+                prepare_symbols: args.prepare_symbols,
+                match_index: args.match_index,
+                set_context: args.set_context,
+                allow_user_software: None,
+            };
+            let (steps, process, candidates) =
+                self.resolve_process_for_breakpoint(&selector).await?;
+            (steps, Some(process), candidates)
+        } else {
+            (Vec::new(), None, Vec::new())
+        };
+
+        let ethread = match trimmed_nonempty(args.ethread.as_deref()) {
+            Some(value) => Some(
+                debugger_atom(value, "ethread")
+                    .map_err(|error| McpError::invalid_params(error, None))?,
+            ),
+            None => None,
+        };
+        let user_mode_address = looks_like_user_mode_address(&args.address);
+        let set_context = process
+            .as_ref()
+            .map(|_| args.set_context.unwrap_or(user_mode_address))
+            .unwrap_or(false);
+        if set_context {
+            if let Some(process) = &process {
+                let context_command = format!(".process /p /r {}", process.eprocess);
+                let context = self
+                    .execute_debugger_command(args.session_id.as_deref(), context_command.clone())
+                    .await?;
+                steps.push(json!({
+                    "tool": "windbg_set_hardware_breakpoint",
+                    "phase": "set_process_context",
+                    "command": context_command,
+                    "result": render_execution_result(context),
+                }));
+            }
+        }
+        let command = build_hardware_breakpoint_command(
+            args.access.as_deref(),
+            args.size,
+            &args.address,
+            args.one_shot,
+            process.as_ref().map(|process| process.eprocess.as_str()),
+            ethread.as_deref(),
+            args.pass_count,
+            args.command.as_deref(),
+        )
+        .map_err(|error| McpError::invalid_params(error, None))?;
+
+        let before_list = self
+            .execute_debugger_command(args.session_id.as_deref(), "bl".to_string())
+            .await?;
+        let before_output = before_list.output.clone();
+        let set = self
+            .execute_debugger_command(args.session_id.as_deref(), command.clone())
+            .await?;
+        let list = self
+            .execute_debugger_command(args.session_id.as_deref(), "bl".to_string())
+            .await?;
+        let created_breakpoints = new_breakpoint_ids(&before_output, &list.output);
+        validate_created_breakpoints(&set.command, &set.output, &created_breakpoints)
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        steps.push(json!({
+            "tool": "windbg_set_hardware_breakpoint",
+            "command": command,
+        }));
+
+        Ok(json!({
+            "process": process,
+            "candidates": candidates,
+            "steps": steps,
+            "set_context": set_context,
+            "user_mode_address": user_mode_address,
+            "breakpoints_before": render_execution_result(before_list),
+            "created_breakpoints": created_breakpoints,
+            "hardware_breakpoint": render_execution_result(set),
             "breakpoints": render_execution_result(list),
         }))
     }
@@ -1829,6 +2452,26 @@ impl WindbgMcpServer {
         args: SetProcessBreakpointArgs,
     ) -> Result<Value, McpError> {
         let (mut steps, process, candidates) = self.resolve_process_for_breakpoint(&args).await?;
+        let user_mode_address = looks_like_user_mode_address(&args.location);
+        if user_mode_address && !args.allow_user_software.unwrap_or(false) {
+            return Err(McpError::invalid_params(
+                "software `bp /p <EPROCESS> <user_va>` can create a breakpoint ID without hitting reliably in live KDNET headless sessions. Use `windbg_set_hardware_breakpoint` with `access: execute`, `size: 1`, and the same process selector, or pass `allow_user_software: true` for an explicit experiment.",
+                None,
+            ));
+        }
+        let set_context = args.set_context.unwrap_or(user_mode_address);
+        if set_context {
+            let context_command = format!(".process /p /r {}", process.eprocess);
+            let context = self
+                .execute_debugger_command(args.session_id.as_deref(), context_command.clone())
+                .await?;
+            steps.push(json!({
+                "tool": "windbg_set_process_breakpoint",
+                "phase": "set_process_context",
+                "command": context_command,
+                "result": render_execution_result(context),
+            }));
+        }
         let ethread = match trimmed_nonempty(args.ethread.as_deref()) {
             Some(value) => Some(
                 debugger_atom(value, "ethread")
@@ -1847,12 +2490,19 @@ impl WindbgMcpServer {
         )
         .map_err(|error| McpError::invalid_params(error, None))?;
 
+        let before_list = self
+            .execute_debugger_command(args.session_id.as_deref(), "bl".to_string())
+            .await?;
+        let before_output = before_list.output.clone();
         let set = self
             .execute_debugger_command(args.session_id.as_deref(), command.clone())
             .await?;
         let list = self
             .execute_debugger_command(args.session_id.as_deref(), "bl".to_string())
             .await?;
+        let created_breakpoints = new_breakpoint_ids(&before_output, &list.output);
+        validate_created_breakpoints(&set.command, &set.output, &created_breakpoints)
+            .map_err(|error| McpError::invalid_params(error, None))?;
         steps.push(json!({
             "tool": "windbg_set_process_breakpoint",
             "command": command,
@@ -1862,6 +2512,9 @@ impl WindbgMcpServer {
             "process": process,
             "candidates": candidates,
             "steps": steps,
+            "set_context": set_context,
+            "breakpoints_before": render_execution_result(before_list),
+            "created_breakpoints": created_breakpoints,
             "breakpoint": render_execution_result(set),
             "breakpoints": render_execution_result(list),
         }))
@@ -1886,6 +2539,8 @@ impl WindbgMcpServer {
             command: args.command,
             prepare_symbols: args.prepare_symbols,
             match_index: args.match_index,
+            set_context: None,
+            allow_user_software: None,
         })
         .await
     }
@@ -1897,6 +2552,17 @@ impl WindbgMcpServer {
 
     async fn clear_breakpoint(&self, args: ClearBreakpointArgs) -> Result<Value, McpError> {
         let breakpoint = trimmed_nonempty(args.breakpoint.as_deref()).unwrap_or("*");
+        let safe = args.safe.unwrap_or(true);
+        let mut steps = Vec::new();
+        if safe {
+            let disable = self
+                .execute_debugger_command(args.session_id.as_deref(), format!("bd {breakpoint}"))
+                .await?;
+            steps.push(json!({
+                "phase": "disable_before_clear",
+                "result": render_execution_result(disable),
+            }));
+        }
         let clear = self
             .execute_debugger_command(args.session_id.as_deref(), format!("bc {breakpoint}"))
             .await?;
@@ -1905,12 +2571,15 @@ impl WindbgMcpServer {
             .await?;
 
         Ok(json!({
+            "safe": safe,
+            "steps": steps,
             "clear": render_execution_result(clear),
             "breakpoints": render_execution_result(list),
         }))
     }
 
     async fn read_registers(&self, args: ReadRegistersArgs) -> Result<Value, McpError> {
+        let session_id = args.session_id.clone();
         let command = match args.registers {
             Some(registers) => {
                 let registers: Result<Vec<String>, String> = registers
@@ -1924,19 +2593,36 @@ impl WindbgMcpServer {
                     .collect();
                 if registers.is_empty() {
                     "r".to_string()
+                } else if registers.len() == 1 {
+                    format!("r {}", registers[0])
                 } else {
-                    registers
-                        .into_iter()
-                        .map(|register| format!("r {register}"))
-                        .collect::<Vec<_>>()
-                        .join("; ")
+                    let mut steps = Vec::new();
+                    let mut output = String::new();
+                    let mut commands = Vec::new();
+                    for register in registers {
+                        let command = format!("r {register}");
+                        let execution = self
+                            .execute_debugger_command(session_id.as_deref(), command.clone())
+                            .await?;
+                        output.push_str(&execution.output);
+                        if !output.ends_with('\n') {
+                            output.push('\n');
+                        }
+                        commands.push(command);
+                        steps.push(render_execution_result(execution));
+                    }
+                    return Ok(json!({
+                        "command": commands.join("; "),
+                        "output": output,
+                        "steps": steps,
+                        "note": "multiple registers were read as isolated commands to avoid fragile raw `r <reg> <reg>` dbgeng states",
+                    }));
                 }
             }
             None => "r".to_string(),
         };
 
-        self.execute_command(args.session_id.as_deref(), command)
-            .await
+        self.execute_command(session_id.as_deref(), command).await
     }
 
     async fn write_register(&self, args: WriteRegisterArgs) -> Result<Value, McpError> {
@@ -2010,34 +2696,394 @@ impl WindbgMcpServer {
         Ok(json!({ "steps": steps }))
     }
 
-    async fn continue_until_break(&self, args: ContinueUntilBreakArgs) -> Result<Value, McpError> {
+    async fn trace_breakpoint(&self, args: TraceBreakpointArgs) -> Result<Value, McpError> {
+        let hit_limit = args.hits.unwrap_or(1).clamp(1, 100);
         let timeout_secs = args.timeout_secs.unwrap_or(30).clamp(1, 3600);
         let poll_interval =
             Duration::from_millis(args.poll_interval_millis.unwrap_or(250).clamp(50, 10_000));
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-        let resumed = self.resume_target(args.session_id.as_deref()).await?;
+        let settle_millis = args.settle_millis.unwrap_or(350).clamp(0, 5_000);
+        let require_stable_break = args.require_stable_break.unwrap_or(true);
+        let auto_resume = args.auto_resume.unwrap_or(true);
+        let clear_after = args.clear_after.unwrap_or(true);
+        let hardware = args.hardware.unwrap_or(false);
 
-        loop {
+        let has_process_selector = trimmed_nonempty(args.eprocess.as_deref()).is_some()
+            || trimmed_nonempty(args.process_name.as_deref()).is_some()
+            || trimmed_nonempty(args.pid.as_deref()).is_some();
+        let (mut setup_steps, process, candidates) = if has_process_selector {
+            let selector = SetProcessBreakpointArgs {
+                session_id: args.session_id.clone(),
+                location: args.location.clone(),
+                process_name: args.process_name.clone(),
+                pid: args.pid.clone(),
+                eprocess: args.eprocess.clone(),
+                ethread: args.ethread.clone(),
+                kind: args.kind.clone(),
+                one_shot: Some(false),
+                pass_count: None,
+                command: None,
+                prepare_symbols: args.prepare_symbols,
+                match_index: args.match_index,
+                set_context: args.set_context,
+                allow_user_software: Some(true),
+            };
+            let (steps, process, candidates) =
+                self.resolve_process_for_breakpoint(&selector).await?;
+            (steps, Some(process), candidates)
+        } else {
+            (Vec::new(), None, Vec::new())
+        };
+
+        let ethread = match trimmed_nonempty(args.ethread.as_deref()) {
+            Some(value) => Some(
+                debugger_atom(value, "ethread")
+                    .map_err(|error| McpError::invalid_params(error, None))?,
+            ),
+            None => None,
+        };
+        let set_context = process
+            .as_ref()
+            .map(|_| {
+                args.set_context
+                    .unwrap_or_else(|| looks_like_user_mode_address(&args.location))
+            })
+            .unwrap_or(false);
+        if set_context {
+            if let Some(process) = &process {
+                let context_command = format!(".process /p /r {}", process.eprocess);
+                let context = self
+                    .execute_debugger_command(args.session_id.as_deref(), context_command.clone())
+                    .await?;
+                setup_steps.push(json!({
+                    "tool": "windbg_trace_breakpoint",
+                    "phase": "set_process_context",
+                    "command": context_command,
+                    "result": render_execution_result(context),
+                }));
+            }
+        }
+
+        let breakpoint_command = if hardware {
+            build_hardware_breakpoint_command(
+                args.access.as_deref(),
+                args.size,
+                &args.location,
+                Some(false),
+                process.as_ref().map(|process| process.eprocess.as_str()),
+                ethread.as_deref(),
+                None,
+                None,
+            )
+        } else {
+            build_breakpoint_command(
+                args.kind.as_deref(),
+                &args.location,
+                Some(false),
+                process.as_ref().map(|process| process.eprocess.as_str()),
+                ethread.as_deref(),
+                None,
+                None,
+            )
+        }
+        .map_err(|error| McpError::invalid_params(error, None))?;
+
+        let before_list = self
+            .execute_debugger_command(args.session_id.as_deref(), "bl".to_string())
+            .await?;
+        let before_output = before_list.output.clone();
+        setup_steps.push(json!({
+            "phase": "breakpoints_before_trace",
+            "result": render_execution_result(before_list),
+        }));
+
+        let set = self
+            .execute_debugger_command(args.session_id.as_deref(), breakpoint_command.clone())
+            .await?;
+        let set_command = set.command.clone();
+        let set_output = set.output.clone();
+        setup_steps.push(json!({
+            "phase": "set_trace_breakpoint",
+            "result": render_execution_result(set),
+        }));
+
+        let after_list = self
+            .execute_debugger_command(args.session_id.as_deref(), "bl".to_string())
+            .await?;
+        let after_output = after_list.output.clone();
+        let created_breakpoints = new_breakpoint_ids(&before_output, &after_output);
+        validate_created_breakpoints(&set_command, &set_output, &created_breakpoints)
+            .map_err(|error| McpError::invalid_params(error, None))?;
+        setup_steps.push(json!({
+            "phase": "breakpoints_after_trace",
+            "result": render_execution_result(after_list),
+            "created_breakpoints": created_breakpoints.clone(),
+        }));
+
+        let mut capture_commands = if args.include_default_snapshot.unwrap_or(true) {
+            default_trace_commands()
+        } else {
+            Vec::new()
+        };
+        for command in args.commands.unwrap_or_default() {
+            let command = command.trim();
+            if !command.is_empty() {
+                capture_commands.push(command.to_string());
+            }
+        }
+
+        let mut hits = Vec::new();
+        let mut timed_out = false;
+        for index in 0..hit_limit {
+            let wait = self
+                .continue_until_break(ContinueUntilBreakArgs {
+                    session_id: args.session_id.clone(),
+                    timeout_secs: Some(timeout_secs),
+                    poll_interval_millis: Some(poll_interval.as_millis() as u64),
+                    settle_millis: Some(settle_millis),
+                    require_stable_break: Some(require_stable_break),
+                })
+                .await?;
+            let wait_timed_out = wait["timed_out"].as_bool().unwrap_or(false);
+            timed_out |= wait_timed_out;
+
+            let mut steps = Vec::new();
+            if !wait_timed_out {
+                for command in &capture_commands {
+                    let (step, _) = self
+                        .diagnostic_command_step(args.session_id.as_deref(), command)
+                        .await;
+                    steps.push(step);
+                }
+            }
+
+            hits.push(json!({
+                "index": index + 1,
+                "wait": wait,
+                "steps": steps,
+                "timed_out": wait_timed_out,
+            }));
+
+            if wait_timed_out || !auto_resume {
+                break;
+            }
+        }
+
+        let mut cleanup_steps = Vec::new();
+        if clear_after && !created_breakpoints.is_empty() {
             let state_payload = self.query_state(args.session_id.as_deref()).await?;
             if state_payload["state"]["ready_for_commands"]
                 .as_bool()
                 .unwrap_or(false)
             {
-                return Ok(json!({
-                    "resumed": resumed,
-                    "final_state": state_payload["state"],
-                    "timed_out": false,
+                for breakpoint in &created_breakpoints {
+                    let disable = self
+                        .execute_debugger_command(
+                            args.session_id.as_deref(),
+                            format!("bd {breakpoint}"),
+                        )
+                        .await?;
+                    cleanup_steps.push(json!({
+                        "phase": "disable_trace_breakpoint",
+                        "breakpoint": breakpoint,
+                        "result": render_execution_result(disable),
+                    }));
+                    let clear = self
+                        .execute_debugger_command(
+                            args.session_id.as_deref(),
+                            format!("bc {breakpoint}"),
+                        )
+                        .await?;
+                    cleanup_steps.push(json!({
+                        "phase": "clear_trace_breakpoint",
+                        "breakpoint": breakpoint,
+                        "result": render_execution_result(clear),
+                    }));
+                }
+                let list = self
+                    .execute_debugger_command(args.session_id.as_deref(), "bl".to_string())
+                    .await?;
+                cleanup_steps.push(json!({
+                    "phase": "breakpoints_after_cleanup",
+                    "result": render_execution_result(list),
+                }));
+            } else {
+                cleanup_steps.push(json!({
+                    "phase": "cleanup_skipped",
+                    "reason": "target was not command-ready; trace breakpoint ids are returned so the caller can clear them after interrupting or on a later break",
+                    "state": state_payload["state"],
+                    "breakpoints": created_breakpoints.clone(),
                 }));
             }
+        }
+
+        let final_resume = if auto_resume {
+            let state_payload = self.query_state(args.session_id.as_deref()).await?;
+            if state_payload["state"]["ready_for_commands"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                Some(self.resume_target(args.session_id.as_deref()).await?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let captured_hits = hits.len();
+        Ok(json!({
+            "breakpoint_command": breakpoint_command,
+            "hardware": hardware,
+            "process": process,
+            "candidates": candidates,
+            "set_context": set_context,
+            "created_breakpoints": created_breakpoints,
+            "capture_commands": capture_commands,
+            "requested_hits": hit_limit,
+            "captured_hits": captured_hits,
+            "timed_out": timed_out,
+            "auto_resume": auto_resume,
+            "clear_after": clear_after,
+            "setup_steps": setup_steps,
+            "hits": hits,
+            "cleanup_steps": cleanup_steps,
+            "final_resume": final_resume,
+            "note": "Trace capture is driven synchronously by MCP after a stable breakpoint hit; avoid command-breakpoint strings that self-continue with `g`/`gc` when reliable output capture matters.",
+        }))
+    }
+
+    async fn poll_until_stable_break(
+        &self,
+        session_id: Option<&str>,
+        timeout_secs: u64,
+        poll_interval: Duration,
+        settle_millis: u64,
+        require_stable_break: bool,
+    ) -> Result<Value, McpError> {
+        let settle_interval = Duration::from_millis(settle_millis);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let mut transient_breaks = 0u64;
+        let mut last_observed_break_state: Option<Value> = None;
+        let mut last_unstable_break_state: Option<Value> = None;
+
+        loop {
+            let state_payload = self.query_state(session_id).await?;
+            let mut state = state_payload["state"].clone();
+            if state["ready_for_commands"].as_bool().unwrap_or(false) {
+                let first_break_state = state.clone();
+                last_observed_break_state = Some(first_break_state.clone());
+                if require_stable_break && !settle_interval.is_zero() {
+                    tokio::time::sleep(settle_interval).await;
+                    let confirmed_payload = self.query_state(session_id).await?;
+                    let confirmed_state = confirmed_payload["state"].clone();
+                    if confirmed_state["ready_for_commands"]
+                        .as_bool()
+                        .unwrap_or(false)
+                    {
+                        return Ok(json!({
+                            "final_state": confirmed_state,
+                            "timed_out": false,
+                            "stability_check": {
+                                "enabled": true,
+                                "settle_millis": settle_millis,
+                                "first_break_state": first_break_state,
+                                "transient_breaks": transient_breaks,
+                                "unstable_breaks": transient_breaks,
+                                "last_observed_break_state": last_observed_break_state,
+                                "last_unstable_break_state": last_unstable_break_state,
+                            },
+                        }));
+                    }
+
+                    transient_breaks += 1;
+                    last_unstable_break_state = Some(confirmed_state.clone());
+                    state = confirmed_state;
+                } else {
+                    return Ok(json!({
+                        "final_state": state,
+                        "timed_out": false,
+                        "stability_check": {
+                            "enabled": false,
+                            "settle_millis": settle_millis,
+                            "transient_breaks": transient_breaks,
+                            "unstable_breaks": transient_breaks,
+                            "last_observed_break_state": last_observed_break_state,
+                            "last_unstable_break_state": last_unstable_break_state,
+                        },
+                    }));
+                }
+            }
+
             if tokio::time::Instant::now() >= deadline {
                 return Ok(json!({
-                    "resumed": resumed,
-                    "final_state": state_payload["state"],
+                    "final_state": state,
                     "timed_out": true,
+                    "stability_check": {
+                        "enabled": require_stable_break,
+                        "settle_millis": settle_millis,
+                        "transient_breaks": transient_breaks,
+                        "unstable_breaks": transient_breaks,
+                        "last_observed_break_state": last_observed_break_state,
+                        "last_unstable_break_state": last_unstable_break_state,
+                    },
                 }));
             }
             tokio::time::sleep(poll_interval).await;
         }
+    }
+
+    async fn continue_until_break(&self, args: ContinueUntilBreakArgs) -> Result<Value, McpError> {
+        let timeout_secs = args.timeout_secs.unwrap_or(30).clamp(1, 3600);
+        let poll_interval =
+            Duration::from_millis(args.poll_interval_millis.unwrap_or(250).clamp(50, 10_000));
+        let settle_millis = args.settle_millis.unwrap_or(350).clamp(0, 5_000);
+        let require_stable_break = args.require_stable_break.unwrap_or(true);
+        let resumed = self.resume_target(args.session_id.as_deref()).await?;
+
+        let mut result = self
+            .poll_until_stable_break(
+                args.session_id.as_deref(),
+                timeout_secs,
+                poll_interval,
+                settle_millis,
+                require_stable_break,
+            )
+            .await?;
+        if let Some(object) = result.as_object_mut() {
+            object.insert("resumed".to_string(), resumed);
+        }
+        Ok(result)
+    }
+
+    async fn step_execution(
+        &self,
+        args: StepExecutionArgs,
+        command: &'static str,
+        label: &'static str,
+    ) -> Result<Value, McpError> {
+        let timeout_secs = args.timeout_secs.unwrap_or(30).clamp(1, 3600);
+        let poll_interval =
+            Duration::from_millis(args.poll_interval_millis.unwrap_or(250).clamp(50, 10_000));
+        let settle_millis = args.settle_millis.unwrap_or(350).clamp(0, 5_000);
+        let require_stable_break = args.require_stable_break.unwrap_or(true);
+        let execution = self
+            .execute_debugger_command(args.session_id.as_deref(), command.to_string())
+            .await?;
+        let wait = self
+            .poll_until_stable_break(
+                args.session_id.as_deref(),
+                timeout_secs,
+                poll_interval,
+                settle_millis,
+                require_stable_break,
+            )
+            .await?;
+
+        Ok(json!({
+            "step": label,
+            "command": render_execution_result(execution),
+            "wait": wait,
+        }))
     }
 
     async fn evaluate_expression(&self, args: EvaluateExpressionArgs) -> Result<Value, McpError> {
@@ -2146,7 +3192,11 @@ impl WindbgMcpServer {
 
         let mut commands = Vec::new();
         if args.clear_existing.unwrap_or(false) {
-            commands.push(format!("sxd {event_filter}"));
+            steps.push(json!({
+                "command": format!("sxd {event_filter}"),
+                "skipped": true,
+                "reason": "disabling `ld` filters with raw `sxd` is blocked in headless mode because this dbgeng path can access-violate after module-load events; opening a fresh short-lived session is safer for clearing load filters",
+            }));
         }
         commands.push(format!("sxe {event_filter}"));
         commands.push("sx".to_string());
@@ -2163,6 +3213,7 @@ impl WindbgMcpServer {
             "event_filter": event_filter,
             "steps": steps,
             "symbols_prepared_before_filter": args.prepare_symbols.unwrap_or(true),
+            "clear_existing_safely_skipped": args.clear_existing.unwrap_or(false),
             "next_step": "resume the target with windbg_continue_until_break or windbg_resume_target, then start/load the driver from the guest",
         }))
     }
@@ -2610,6 +3661,144 @@ impl WindbgMcpServer {
         }))
     }
 
+    async fn minifilter_message_snapshot(
+        &self,
+        args: MinifilterMessageSnapshotArgs,
+    ) -> Result<Value, McpError> {
+        let input_buffer = match trimmed_nonempty(args.input_buffer.as_deref()) {
+            Some(value) => debugger_atom(value, "input_buffer")
+                .map_err(|error| McpError::invalid_params(error, None))?,
+            None => "@rdx".to_string(),
+        };
+        let input_length = match trimmed_nonempty(args.input_length.as_deref()) {
+            Some(value) => debugger_atom(value, "input_length")
+                .map_err(|error| McpError::invalid_params(error, None))?,
+            None => "@r8".to_string(),
+        };
+        let output_buffer = match trimmed_nonempty(args.output_buffer.as_deref()) {
+            Some(value) => debugger_atom(value, "output_buffer")
+                .map_err(|error| McpError::invalid_params(error, None))?,
+            None => "@r9".to_string(),
+        };
+        let output_length = match trimmed_nonempty(args.output_length.as_deref()) {
+            Some(value) => debugger_atom(value, "output_length")
+                .map_err(|error| McpError::invalid_params(error, None))?,
+            None => "poi(@rsp+28)".to_string(),
+        };
+        let return_length_ptr = match trimmed_nonempty(args.return_length_ptr.as_deref()) {
+            Some(value) => debugger_atom(value, "return_length_ptr")
+                .map_err(|error| McpError::invalid_params(error, None))?,
+            None => "poi(@rsp+30)".to_string(),
+        };
+        let input_count = clamp_count(args.input_count, 0x80, 0x1000);
+        let output_count = clamp_count(args.output_count, 0x80, 0x1000);
+        let stack_count = clamp_count(args.stack_count, 32, 512);
+        let backtrace_count = clamp_count(args.backtrace_count, 32, 512);
+
+        let input_length_command = format!("? {input_length}");
+        let output_length_command = format!("? {output_length}");
+        let return_length_ptr_command = format!("? {return_length_ptr}");
+        let input_bytes_command = format!("db {input_buffer} L{input_count}");
+        let output_bytes_command = format!("db {output_buffer} L{output_count}");
+
+        let commands = vec![
+            ("last_event", ".lastevent".to_string()),
+            ("registers", "r".to_string()),
+            ("disassembly", "u @rip L16".to_string()),
+            ("backtrace", format!("kv {backtrace_count}")),
+            ("stack", format!("dq @rsp L{stack_count}")),
+            ("input_length", input_length_command.clone()),
+            ("output_length", output_length_command.clone()),
+            ("return_length_ptr", return_length_ptr_command.clone()),
+            ("input_bytes", input_bytes_command.clone()),
+            (
+                "input_dwords",
+                format!("dd {input_buffer} L{}", input_count.div_ceil(4)),
+            ),
+            (
+                "input_qwords",
+                format!("dq {input_buffer} L{}", input_count.div_ceil(8)),
+            ),
+            ("output_bytes", output_bytes_command.clone()),
+            (
+                "output_dwords",
+                format!("dd {output_buffer} L{}", output_count.div_ceil(4)),
+            ),
+            ("breakpoints", "bl".to_string()),
+        ];
+
+        let mut steps = Vec::new();
+        let mut input_length_output = String::new();
+        let mut output_length_output = String::new();
+        let mut return_length_ptr_output = String::new();
+        let mut input_bytes_output = String::new();
+        let mut output_bytes_output = String::new();
+
+        for (label, command) in commands {
+            let (mut step, _) = self
+                .diagnostic_command_step(args.session_id.as_deref(), &command)
+                .await;
+            if let Some(object) = step.as_object_mut() {
+                object.insert("label".to_string(), json!(label));
+            }
+            match label {
+                "input_length" => {
+                    input_length_output = step["output"].as_str().unwrap_or_default().to_string();
+                }
+                "output_length" => {
+                    output_length_output = step["output"].as_str().unwrap_or_default().to_string();
+                }
+                "return_length_ptr" => {
+                    return_length_ptr_output =
+                        step["output"].as_str().unwrap_or_default().to_string();
+                }
+                "input_bytes" => {
+                    input_bytes_output = step["output"].as_str().unwrap_or_default().to_string();
+                }
+                "output_bytes" => {
+                    output_bytes_output = step["output"].as_str().unwrap_or_default().to_string();
+                }
+                _ => {}
+            }
+            steps.push(step);
+        }
+
+        let input_first_bytes = parse_db_bytes(&input_bytes_output, 64);
+        let output_first_bytes = parse_db_bytes(&output_bytes_output, 64);
+        let message_id = parse_le_u32_from_hex_bytes(&input_first_bytes, 0);
+        let payload_length = parse_le_u32_from_hex_bytes(&input_first_bytes, 4);
+
+        Ok(json!({
+            "abi": "FLT_PORT_MESSAGE_NOTIFY_CALLBACK_x64",
+            "expressions": {
+                "input_buffer": input_buffer,
+                "input_length": input_length,
+                "output_buffer": output_buffer,
+                "output_length": output_length,
+                "return_length_ptr": return_length_ptr,
+            },
+            "summary": {
+                "input_length_value": parse_evaluator_u64(&input_length_output),
+                "output_length_value": parse_evaluator_u64(&output_length_output),
+                "return_length_ptr_value": parse_evaluator_u64(&return_length_ptr_output),
+                "input_first_bytes": input_first_bytes,
+                "input_first_hex": contiguous_hex(&input_first_bytes),
+                "output_first_bytes": output_first_bytes,
+                "output_first_hex": contiguous_hex(&output_first_bytes),
+                "message_header": {
+                    "message_id": message_id,
+                    "payload_length": payload_length,
+                },
+            },
+            "steps": steps,
+            "notes": [
+                "Defaults assume the breakpoint is at the minifilter MessageNotifyCallback entry: rcx=PortCookie, rdx=InputBuffer, r8=InputBufferLength, r9=OutputBuffer.",
+                "On Windows x64, OutputBufferLength and ReturnOutputBufferLength are stack arguments, defaulting to poi(@rsp+28) and poi(@rsp+30).",
+                "Pass explicit expressions when breaking after the prologue or inside a wrapper/virtualized callback."
+            ],
+        }))
+    }
+
     async fn query_state(&self, session_id: Option<&str>) -> Result<Value, McpError> {
         let state = match &self.backend {
             ServerBackend::AttachedSession { dispatcher } => dispatcher
@@ -2723,7 +3912,7 @@ impl WindbgMcpServer {
 impl ServerHandler for WindbgMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.is_headless() {
-            "Open a session with `windbg_open_session` before using debugger actions. Use `windbg_set_breakpoint`, `windbg_find_process`, `windbg_set_process_breakpoint`, `windbg_set_syscall_breakpoint`, `windbg_set_driver_load_breakpoint`, `windbg_driver_summary`, `windbg_set_driver_dispatch_breakpoints`, `windbg_driver_dispatch_snapshot`, `windbg_ioctl_snapshot`, `windbg_continue_until_break`, `windbg_breakpoint_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common reverse-engineering and kernel-driver flows. Use `windbg_execute_command` for raw WinDbg commands, `windbg_get_output` with cursors for buffered output, and `windbg_resume_target` to continue a live target without blocking on raw `g`. Use `windbg_recover_session` if a live KDNET target may have been left broken. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
+            "Open a session with `windbg_open_session` before using debugger actions. Use `windbg_set_breakpoint`, `windbg_set_hardware_breakpoint`, `windbg_trace_breakpoint`, `windbg_find_process`, `windbg_set_process_breakpoint`, `windbg_set_syscall_breakpoint`, `windbg_set_driver_load_breakpoint`, `windbg_driver_summary`, `windbg_set_driver_dispatch_breakpoints`, `windbg_driver_dispatch_snapshot`, `windbg_ioctl_snapshot`, `windbg_minifilter_message_snapshot`, `windbg_dbgprint`, `windbg_continue_until_break`, `windbg_step`, `windbg_step_over`, `windbg_go_up`, `windbg_breakpoint_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common reverse-engineering and kernel-driver flows. Use `windbg_execute_command` for raw WinDbg commands, `windbg_get_output` with cursors for buffered output, and `windbg_resume_target` to continue a live target without blocking on raw `g`. Use `windbg_recover_session` if a live KDNET target may have been left broken. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
         } else {
             "This server is organized around low-context resources plus a small toolset. Start with `windbg_search_catalog`, read `windbg://command/{id}`, optionally escalate to `windbg://command-full/{id}`, then call `windbg_get_execution_state`. If the debugger is running or busy, call `windbg_interrupt_target` and verify state again before calling `windbg_execute_command`. Use `windbg_get_output` to read buffered command output again later, and `windbg_resume_target` to continue execution without issuing a raw `g` command."
         };
@@ -2759,7 +3948,9 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_get_output" => Some(self.output_tool()),
             "windbg_prepare_symbols" => Some(self.prepare_symbols_tool()),
             "windbg_diagnose_extensions" => Some(self.diagnose_extensions_tool()),
+            "windbg_dbgprint" => Some(self.dbgprint_tool()),
             "windbg_set_breakpoint" => Some(self.set_breakpoint_tool()),
+            "windbg_set_hardware_breakpoint" => Some(self.set_hardware_breakpoint_tool()),
             "windbg_find_process" => Some(self.find_process_tool()),
             "windbg_set_process_breakpoint" => Some(self.set_process_breakpoint_tool()),
             "windbg_set_syscall_breakpoint" => Some(self.set_syscall_breakpoint_tool()),
@@ -2771,7 +3962,11 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_disassemble" => Some(self.disassemble_tool()),
             "windbg_backtrace" => Some(self.backtrace_tool()),
             "windbg_breakpoint_snapshot" => Some(self.breakpoint_snapshot_tool()),
+            "windbg_trace_breakpoint" => Some(self.trace_breakpoint_tool()),
             "windbg_continue_until_break" => Some(self.continue_until_break_tool()),
+            "windbg_step" => Some(self.step_tool()),
+            "windbg_step_over" => Some(self.step_over_tool()),
+            "windbg_go_up" => Some(self.go_up_tool()),
             "windbg_evaluate_expression" => Some(self.evaluate_expression_tool()),
             "windbg_list_modules" => Some(self.list_modules_tool()),
             "windbg_search_symbols" => Some(self.search_symbols_tool()),
@@ -2783,6 +3978,7 @@ impl ServerHandler for WindbgMcpServer {
             }
             "windbg_driver_dispatch_snapshot" => Some(self.driver_dispatch_snapshot_tool()),
             "windbg_ioctl_snapshot" => Some(self.ioctl_snapshot_tool()),
+            "windbg_minifilter_message_snapshot" => Some(self.minifilter_message_snapshot_tool()),
             "windbg_search_catalog" => Some(self.search_tool()),
             "windbg_interrupt_target" => Some(self.interrupt_tool()),
             "windbg_resume_target" => Some(self.resume_tool()),
@@ -2831,9 +4027,19 @@ impl ServerHandler for WindbgMcpServer {
                 let payload = self.diagnose_extensions(args).await?;
                 Ok(CallToolResult::structured(payload))
             }
+            "windbg_dbgprint" => {
+                let args: DbgPrintArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.dbgprint(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
             "windbg_set_breakpoint" => {
                 let args: SetBreakpointArgs = self.parse_arguments(request.arguments)?;
                 let payload = self.set_breakpoint(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_set_hardware_breakpoint" => {
+                let args: SetHardwareBreakpointArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.set_hardware_breakpoint(args).await?;
                 Ok(CallToolResult::structured(payload))
             }
             "windbg_find_process" => {
@@ -2891,9 +4097,29 @@ impl ServerHandler for WindbgMcpServer {
                 let payload = self.breakpoint_snapshot(args).await?;
                 Ok(CallToolResult::structured(payload))
             }
+            "windbg_trace_breakpoint" => {
+                let args: TraceBreakpointArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.trace_breakpoint(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
             "windbg_continue_until_break" => {
                 let args: ContinueUntilBreakArgs = self.parse_arguments(request.arguments)?;
                 let payload = self.continue_until_break(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_step" => {
+                let args: StepExecutionArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.step_execution(args, "t", "step_into").await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_step_over" => {
+                let args: StepExecutionArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.step_execution(args, "p", "step_over").await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_go_up" => {
+                let args: StepExecutionArgs = self.parse_arguments(request.arguments)?;
+                let payload = self.step_execution(args, "gu", "go_up").await?;
                 Ok(CallToolResult::structured(payload))
             }
             "windbg_evaluate_expression" => {
@@ -2940,6 +4166,12 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_ioctl_snapshot" => {
                 let args: IoctlSnapshotArgs = self.parse_arguments(request.arguments)?;
                 let payload = self.ioctl_snapshot(args).await?;
+                Ok(CallToolResult::structured(payload))
+            }
+            "windbg_minifilter_message_snapshot" => {
+                let args: MinifilterMessageSnapshotArgs =
+                    self.parse_arguments(request.arguments)?;
+                let payload = self.minifilter_message_snapshot(args).await?;
                 Ok(CallToolResult::structured(payload))
             }
             "windbg_search_catalog" => {
@@ -3197,6 +4429,34 @@ mod tests {
         assert_eq!(payload["output"], "ntdll!_PEB_LDR_DATA");
     }
 
+    #[tokio::test]
+    async fn dbgprint_returns_bounded_tail_from_mock_dispatcher() {
+        let mut responses = HashMap::new();
+        responses.insert(".load kdexts".to_string(), "kdexts loaded".to_string());
+        responses.insert(
+            "!dbgprint".to_string(),
+            "first debug line\nsecond debug line\nthird debug line".to_string(),
+        );
+        let dispatcher = CommandDispatcher::spawn(ExecutionMode::Mock { responses })
+            .expect("dispatcher should start");
+        let server = WindbgMcpServer::new(dispatcher);
+
+        let payload = server
+            .dbgprint(DbgPrintArgs {
+                lines: Some(2),
+                ..Default::default()
+            })
+            .await
+            .expect("dbgprint should succeed");
+
+        assert_eq!(payload["command"], "!dbgprint");
+        assert_eq!(payload["line_count"], 3);
+        assert_eq!(payload["returned_line_count"], 2);
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["output"], "second debug line\nthird debug line");
+        assert!(payload.get("raw_output").is_none());
+    }
+
     #[test]
     fn interrupt_tool_is_exposed() {
         let dispatcher = CommandDispatcher::spawn(ExecutionMode::Mock {
@@ -3256,11 +4516,22 @@ mod tests {
     }
 
     #[test]
+    fn dbgprint_tool_is_exposed_in_headless_mode() {
+        let server = WindbgMcpServer::headless(HeadlessSessionManager::new());
+
+        let tool = server
+            .get_tool("windbg_dbgprint")
+            .expect("DbgPrint tool should be listed for headless mode");
+        assert_eq!(tool.name, "windbg_dbgprint");
+    }
+
+    #[test]
     fn reverse_engineering_tools_are_exposed_in_headless_mode() {
         let server = WindbgMcpServer::headless(HeadlessSessionManager::new());
 
         for name in [
             "windbg_set_breakpoint",
+            "windbg_set_hardware_breakpoint",
             "windbg_find_process",
             "windbg_set_process_breakpoint",
             "windbg_set_syscall_breakpoint",
@@ -3272,7 +4543,11 @@ mod tests {
             "windbg_disassemble",
             "windbg_backtrace",
             "windbg_breakpoint_snapshot",
+            "windbg_trace_breakpoint",
             "windbg_continue_until_break",
+            "windbg_step",
+            "windbg_step_over",
+            "windbg_go_up",
             "windbg_evaluate_expression",
             "windbg_list_modules",
             "windbg_search_symbols",
@@ -3282,12 +4557,23 @@ mod tests {
             "windbg_set_driver_dispatch_breakpoints",
             "windbg_driver_dispatch_snapshot",
             "windbg_ioctl_snapshot",
+            "windbg_minifilter_message_snapshot",
+            "windbg_dbgprint",
         ] {
             let tool = server
                 .get_tool(name)
                 .unwrap_or_else(|| panic!("{name} should be listed for headless mode"));
             assert_eq!(tool.name, name);
         }
+    }
+
+    #[test]
+    fn tail_output_lines_returns_bounded_tail() {
+        let (lines, total, truncated) = tail_output_lines("one\ntwo\nthree\nfour", 2);
+
+        assert_eq!(total, 4);
+        assert!(truncated);
+        assert_eq!(lines, vec!["three".to_string(), "four".to_string()]);
     }
 
     #[test]
@@ -3321,6 +4607,65 @@ mod tests {
             .expect("process breakpoint command"),
             r#"bp /1 /p ffff800ff5aa7040 nt!NtCreateFile "r; kv 8""#
         );
+    }
+
+    #[test]
+    fn builds_hardware_breakpoint_commands() {
+        assert_eq!(
+            build_hardware_breakpoint_command(
+                Some("write"),
+                Some(4),
+                "fffff806`12345678",
+                Some(true),
+                Some("ffff800ff5aa7040"),
+                None,
+                Some(2),
+                Some("r; kv 8")
+            )
+            .expect("hardware breakpoint command"),
+            r#"ba w 4 /1 /p ffff800ff5aa7040 fffff806`12345678 2 "r; kv 8""#
+        );
+    }
+
+    #[test]
+    fn parses_created_breakpoint_ids_from_bl_output() {
+        let before = r#"
+0 e Disable Clear  fffff806`11111111     0001 (0001) nt!DbgBreakPoint
+"#;
+        let after = r#"
+0 e Disable Clear  fffff806`11111111     0001 (0001) nt!DbgBreakPoint
+1 e Disable Clear  fffff806`22222222     0001 (0001) mydriver+0x123
+2: e Disable Clear  fffff806`33333333     0001 (0001) mydriver+0x456
+"#;
+
+        assert_eq!(parse_breakpoint_ids(after), vec!["0", "1", "2"]);
+        assert_eq!(new_breakpoint_ids(before, after), vec!["1", "2"]);
+    }
+
+    #[test]
+    fn detects_breakpoint_creation_failures() {
+        assert!(output_indicates_breakpoint_failure(
+            "Couldn't resolve error at 'nt!MissingSymbol'"
+        ));
+        assert!(validate_created_breakpoints("bp missing", "", &[]).is_err());
+        assert!(
+            validate_created_breakpoints("bp nt!DbgBreakPoint", "", &["0".to_string()]).is_ok()
+        );
+    }
+
+    #[test]
+    fn detects_user_mode_addresses_for_process_context() {
+        assert!(looks_like_user_mode_address("0x7ff83ba4dc80"));
+        assert!(looks_like_user_mode_address("00007ff8`3ba4dc80"));
+        assert!(!looks_like_user_mode_address("fffff806`82e57490"));
+        assert!(!looks_like_user_mode_address("nt!KeDelayExecutionThread"));
+    }
+
+    #[test]
+    fn blocks_fragile_raw_multi_register_reads() {
+        assert!(blocked_unsafe_debugger_command("r rip rax rcx").is_some());
+        assert!(blocked_unsafe_debugger_command("r rax=1").is_none());
+        assert!(blocked_unsafe_debugger_command("r rip").is_none());
     }
 
     #[test]
@@ -3428,6 +4773,31 @@ ffffda8a`cab17150  ff ee                                      ..
                 "00", "00", "ff", "ee"
             ]
         );
+    }
+
+    #[test]
+    fn parses_minifilter_message_header_from_bytes() {
+        let output = r#"
+ffffda8a`ca000000  04 40 15 00 1c 00 00 00-33 1b 4f 4b 32 34 3e 20  .@......3.OK24>
+"#;
+
+        let bytes = parse_db_bytes(output, 16);
+
+        assert_eq!(parse_le_u32_from_hex_bytes(&bytes, 0), Some(0x0015_4004));
+        assert_eq!(parse_le_u32_from_hex_bytes(&bytes, 4), Some(0x1c));
+        assert_eq!(
+            contiguous_hex(&bytes).as_deref(),
+            Some("044015001c000000331b4f4b32343e20")
+        );
+    }
+
+    #[test]
+    fn blocks_dangerous_load_filter_disable_commands() {
+        assert!(blocked_unsafe_debugger_command("sxd ld").is_some());
+        assert!(blocked_unsafe_debugger_command("  sxd   ld:ACEDriver.sys  ").is_some());
+        assert!(blocked_unsafe_debugger_command("bp nt!DbgBreakPoint; sxd ld*").is_some());
+        assert!(blocked_unsafe_debugger_command("sxe ld:ACEDriver.sys").is_none());
+        assert!(blocked_unsafe_debugger_command("bc *").is_none());
     }
 
     #[test]

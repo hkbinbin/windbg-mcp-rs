@@ -62,6 +62,7 @@ pub struct HeadlessSessionManager {
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CLOSE_RESUME_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_KERNEL_CLOSE_POST_RESUME_DELAY: Duration = Duration::from_secs(2);
+const DEFAULT_CLOSE_RESUME_VERIFY_ATTEMPTS: usize = 3;
 const DEFAULT_RESUME_BEFORE_CLOSE: bool = true;
 
 struct SessionRegistry {
@@ -575,53 +576,68 @@ async fn resume_session_before_close(
     dispatcher: &CommandDispatcher,
     transport: &str,
 ) -> (bool, Option<String>) {
-    let state = match timeout(DEFAULT_CLOSE_RESUME_TIMEOUT, dispatcher.query_state()).await {
-        Ok(Ok(state)) => state,
-        Ok(Err(error)) => return (false, Some(error.to_string())),
-        Err(_) => {
+    let mut attempted = false;
+    let mut last_error = None;
+
+    for attempt in 0..DEFAULT_CLOSE_RESUME_VERIFY_ATTEMPTS {
+        let state = match timeout(DEFAULT_CLOSE_RESUME_TIMEOUT, dispatcher.query_state()).await {
+            Ok(Ok(state)) => state,
+            Ok(Err(error)) => return (attempted, Some(error.to_string())),
+            Err(_) => {
+                return (
+                    attempted,
+                    Some(format!(
+                        "timed out after {} seconds while checking whether the target should be resumed before close",
+                        DEFAULT_CLOSE_RESUME_TIMEOUT.as_secs()
+                    )),
+                );
+            }
+        };
+
+        if state.running {
+            if transport == "kernel" {
+                sleep(DEFAULT_KERNEL_CLOSE_POST_RESUME_DELAY).await;
+            }
+            continue;
+        }
+
+        if !state.ready_for_commands {
             return (
-                false,
+                attempted,
                 Some(format!(
-                    "timed out after {} seconds while checking whether the target should be resumed before close",
-                    DEFAULT_CLOSE_RESUME_TIMEOUT.as_secs()
+                    "target was not resumed before close because debugger status is {} ({}): {}",
+                    state.status_name, state.raw_status, state.summary
                 )),
             );
         }
-    };
 
-    if state.running {
-        if transport == "kernel" {
-            sleep(DEFAULT_KERNEL_CLOSE_POST_RESUME_DELAY).await;
-        }
-        return (false, None);
-    }
-
-    if !state.ready_for_commands {
-        return (
-            false,
-            Some(format!(
-                "target was not resumed before close because debugger status is {} ({}): {}",
-                state.status_name, state.raw_status, state.summary
-            )),
-        );
-    }
-
-    match timeout(DEFAULT_CLOSE_RESUME_TIMEOUT, dispatcher.resume()).await {
-        Ok(Ok(state_after)) => {
-            if transport == "kernel" && state_after.running {
-                sleep(DEFAULT_KERNEL_CLOSE_POST_RESUME_DELAY).await;
+        attempted = true;
+        match timeout(DEFAULT_CLOSE_RESUME_TIMEOUT, dispatcher.resume()).await {
+            Ok(Ok(state_after)) => {
+                last_error = None;
+                if transport == "kernel" && state_after.running {
+                    sleep(DEFAULT_KERNEL_CLOSE_POST_RESUME_DELAY).await;
+                }
             }
-            (true, None)
+            Ok(Err(error)) => {
+                last_error = Some(error.to_string());
+                if attempt + 1 >= DEFAULT_CLOSE_RESUME_VERIFY_ATTEMPTS {
+                    return (attempted, last_error);
+                }
+            }
+            Err(_) => {
+                last_error = Some(format!(
+                    "timed out after {} seconds while resuming the target before close",
+                    DEFAULT_CLOSE_RESUME_TIMEOUT.as_secs()
+                ));
+                if attempt + 1 >= DEFAULT_CLOSE_RESUME_VERIFY_ATTEMPTS {
+                    return (attempted, last_error);
+                }
+            }
         }
-        Ok(Err(error)) => (true, Some(error.to_string())),
-        Err(_) => (
-            true,
-            Some(format!(
-                "timed out after {} seconds while resuming the target before close",
-                DEFAULT_CLOSE_RESUME_TIMEOUT.as_secs()
-            )),
-        ),
     }
+
+    (attempted, last_error)
 }
 
 fn normalize_kernel_connect_options(raw: &str) -> Result<String, ExecutionError> {

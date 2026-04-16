@@ -33,6 +33,9 @@
 - [x] Add high-level reverse-engineering MCP wrappers for common breakpoint-hit work.
   Added `windbg_set_breakpoint`, `windbg_find_process`, `windbg_set_process_breakpoint`, `windbg_set_syscall_breakpoint`, `windbg_list_breakpoints`, `windbg_clear_breakpoint`, `windbg_continue_until_break`, `windbg_read_registers`, `windbg_write_register`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_breakpoint_snapshot`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver`. Live smoke validation covered breakpoint setup/list/clear, register reads, stack memory reads, disassembly, backtrace, and snapshot collection.
 
+- [x] Add first-class hardware breakpoint/watchpoint support.
+  Added `windbg_set_hardware_breakpoint`, wrapping WinDbg `ba` for execute/read/write/io hardware breakpoints. It supports byte sizes 1/2/4/8, one-shot/pass-count command strings, and optional process/thread scoping. This is the preferred path for self-modifying or packed code where software `bp` patching can perturb execution.
+
 - [x] Make `NtCreateFile` / `NtDeviceIoControlFile` breakpoint workflows stable in headless mode.
   Added `windbg_set_syscall_breakpoint`, which resolves a process through `!process`, prepares `nt` symbols on demand, and sets native WinDbg `bp /p <EPROCESS>` breakpoints for syscalls such as `NtCreateFile` and `NtDeviceIoControlFile`. This avoids unrelated system-wide syscall hits.
 
@@ -57,6 +60,54 @@
 - [x] Add a thread-list fallback for `~` when dbgeng reports transient `0x80040205`.
   The fallback uses `IDebugSystemObjects` to return current/event thread ids instead of failing outright.
 
+- [x] Block the crash-prone `sxd ld*` path after driver-load events.
+  Live ACE testing showed raw `sxd ld:ACEDriver.sys` can access-violate inside dbgeng after an `sxe ld:*` break. `windbg_execute_command` now rejects that command before it reaches dbgeng, and `windbg_set_driver_load_breakpoint` records a skipped clear step instead of executing `sxd`.
+
+- [x] Add a minifilter communication-port snapshot tool.
+  Added `windbg_minifilter_message_snapshot` for `FltCreateCommunicationPort` / `FilterSendMessage` callbacks. Live ACE validation at `ACEDriver+0x1280` captured `InputBuffer=@rdx`, `InputBufferLength=@r8`, message id `0x00154004`, payload length `0x1c`, transformed payload bytes, registers, disassembly, stack, and backtrace.
+
+- [x] Harden break waiting and long-running interrupt behavior.
+  `windbg_continue_until_break` now confirms a short stable break window before returning, and `windbg_interrupt_target` reissues active break-in requests while waiting. Live retest resumed the VM, kept SSH reachable, then interrupted again and executed `vertarget` successfully.
+
+- [x] Add a repeatable user-mode `/p <EPROCESS> <user_va>` breakpoint regression.
+  The new stable-break guard should prevent the earlier false break return, but the latest live retest focused on kernel driver load, driver code, and minifilter callback breakpoints. A dedicated user-mode VA hit should still be scripted before claiming full user-mode process breakpoint coverage.
+  Added `tools/headless_user_va_breakpoint_smoke.py`, which resolves a process or accepts a known EPROCESS, sets `windbg_set_process_breakpoint` on an arbitrary user VA/symbol, waits with `windbg_continue_until_break`, captures `windbg_breakpoint_snapshot`, clears breakpoints, and closes the session.
+
+- [x] Switch process context for process-scoped user-mode VA breakpoints.
+  Live validation showed `bp /p <EPROCESS> <user_va>` can create a breakpoint ID but never hit if dbgeng has not switched to the target process address context. `windbg_set_process_breakpoint`, `windbg_set_hardware_breakpoint`, and `windbg_trace_breakpoint` now run `.process /p /r <EPROCESS>` automatically for low canonical user-mode addresses, or when callers pass `set_context:true`.
+  Follow-up live validation showed software `bp /p <EPROCESS> <user_va>` still did not hit reliably even after context switching, while hardware `ba e 1 /p <EPROCESS> <user_va>` hit the target PowerShell process at `ntdll!NtDelayExecution`. `windbg_set_process_breakpoint` now rejects low user-mode VA software breakpoints by default and points callers to `windbg_set_hardware_breakpoint`; pass `allow_user_software:true` only for explicit experiments.
+
+- [x] Run the user-mode `/p <EPROCESS> <user_va>` regression against a real guest process.
+  Live validated with a guest PowerShell process that directly P/Invoked `ntdll!NtDelayExecution`. Hardware `ba e 1 /p <EPROCESS> 0x7ff83ba4dc80` hit successfully and returned `rip=00007ff83ba4dc80`; software `bp /p` timed out and is now guarded by default.
+
+- [x] Add first-class stepping wrappers for headless dynamic reversing.
+  ACE live solving showed raw `gu` returns immediately with the target in `go` instead of blocking until the temporary return breakpoint is hit. Add `windbg_step`, `windbg_step_over`, and `windbg_go_up` tools that issue `t` / `p` / `gu`, poll execution state, and only return when a stable break is available.
+  Implemented `windbg_step`, `windbg_step_over`, and `windbg_go_up` with the same stable-break polling used by `windbg_continue_until_break`.
+
+- [x] Add structured transient-break diagnostics.
+  ACE breakpoints around `ACEDriver+0x9c51` and callback entry sometimes produced transient break states that returned to `go` during the settle window. Add a regression that captures short-lived code stops and verifies `continue_until_break` either returns a command-ready stop or reports a structured transient-break diagnostic with the last observed event.
+  `windbg_continue_until_break` now reports `transient_breaks`, `last_observed_break_state`, and `last_unstable_break_state` through the shared stable-break poller. A live short-break regression is still useful, but the MCP now exposes the diagnostic data needed by clients.
+
+- [x] Add a live short-breakpoint stability regression.
+  Script a repeatable target that hits and immediately continues or briefly oscillates between `break` and `go`, then assert `windbg_continue_until_break` either returns a stable command-ready stop or a timeout with nonzero `transient_breaks`.
+  Live attempted with `bp /1 nt!KeDelayExecutionThread "gc"` plus a guest sleep trigger. On this dbgeng/KDNET path, the command breakpoint did not self-continue; it returned a stable command-ready break, which `windbg_continue_until_break` correctly reported as stable. This did not reproduce a transient break, but it validates the stable-break guard did not falsely report `go` as command-ready and further supports using `windbg_trace_breakpoint` instead of self-continuing command breakpoints.
+
+- [x] Harden command-breakpoint output capture.
+  ACE testing showed `bp <addr> ".echo ...; r; dd ...; g/gc"` is accepted but does not reliably capture asynchronous output through `windbg_get_output` or behave like interactive WinDbg log-and-continue tracing. Add an explicit regression and, if dbgeng output callbacks are insufficient, a higher-level MCP trace-breakpoint abstraction.
+  Added `windbg_trace_breakpoint`, which sets a temporary software or hardware breakpoint, resumes, waits for stable hit(s), runs capture commands synchronously, clears the newly created breakpoint IDs, and resumes by default. Added `tools/headless_trace_breakpoint_smoke.py` for live validation without storing KDNET secrets.
+
+- [x] Add a live `windbg_trace_breakpoint` regression against a real guest workload.
+  Use `tools/headless_trace_breakpoint_smoke.py` with a guest trigger command to confirm trace hits, cleanup, and final resume on ShadowGate/ACE-style targets.
+  Live validated both software and hardware trace modes against `nt!KeDelayExecutionThread` with a guest PowerShell `Start-Sleep` trigger. Both modes captured a stable hit, returned `rip` and `kv`, cleaned up the new breakpoint ID, resumed the guest, and left SSH reachable.
+
+- [x] Avoid fragile raw register subset commands in stepping workflows.
+  Raw `r rip rax rcx ...; u @rip L1` triggered an `0x80040205` unsettled host state while full `r` was reliable. Prefer `windbg_read_registers` for subsets, add live coverage for register subset reads during breakpoints, and consider blocking or rewriting fragile raw `r <many-registers>` command forms.
+  `windbg_execute_command` now rejects raw multi-register `r <reg> <reg>` reads and points callers to `windbg_read_registers`. `windbg_read_registers` executes each requested register as an isolated command.
+
+- [x] Add safer breakpoint cleanup while stopped on a breakpoint.
+  ACE helper stepping showed clearing all breakpoints at the current stop can make the next command fragile in some dbgeng states. Add a cleanup helper that detects the current stop address, steps/restores safely if needed, then clears breakpoints.
+  `windbg_clear_breakpoint` now defaults to `bd <breakpoint>` before `bc <breakpoint>` and returns disable/clear/list steps. This is a conservative cleanup improvement, not a full software-breakpoint instruction restoration engine.
+
 ## P1 WinDbg Extension Support
 
 - [x] Fix extension DLL discovery/loading in headless sessions.
@@ -75,6 +126,9 @@
 
 - [x] Add a symbol bootstrap workflow for extension-backed commands.
   `windbg_prepare_symbols` now reads `!lmi`, downloads the exact CodeView PDB into the local cache, appends the exact PDB directory to `.sympath`, and reloads the module. Live KDNET validation prepared `nt` symbols, loaded `kdexts`, and then ran `!process 0 0` plus `!drvobj ShadowGate 7` successfully.
+
+- [x] Add a dedicated MCP interface for kernel DbgPrint output.
+  Added `windbg_dbgprint`, which loads `kdexts` by default, runs `!dbgprint`, returns a bounded tail of recent lines, and reports symbol/extension remediation hints. This complements generic `windbg_get_output` by exposing DbgPrint collection as a first-class structured tool.
 
 ## P1 ShadowGate Validation
 

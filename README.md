@@ -9,7 +9,7 @@
 - Resume a running target without blocking on a raw `g` command
 - Manage headless debugger sessions (`open`, `list`, `switch`, `close`)
 - Use the server from any MCP client over stdio by default, or Streamable HTTP when `--listen` is passed
-- Use higher-level reverse-engineering MCP tools for breakpoints, registers, memory, disassembly, backtraces, expressions, modules, symbols, and driver objects
+- Use higher-level reverse-engineering MCP tools for breakpoints, registers, memory, disassembly, backtraces, expressions, modules, symbols, DbgPrint output, and driver objects
 
 ## Setup
 
@@ -190,6 +190,17 @@ windbg_backtrace {"format":"kv","count":32}
 windbg_resume_target
 ```
 
+For Filter Manager communication-port drivers, break at the minifilter
+`MessageNotifyCallback` and use:
+
+```text
+windbg_minifilter_message_snapshot {"input_count":256}
+```
+
+This captures the callback registers, stack arguments, input/output buffers,
+message header, disassembly, and backtrace without forcing the workflow through
+IRP/IOCTL assumptions.
+
 Always resume or close cleanly when finished:
 
 ```text
@@ -218,16 +229,22 @@ Live-target control is split into explicit tools:
 - `windbg_execute_command`
 - `windbg_prepare_symbols`
 - `windbg_diagnose_extensions`
+- `windbg_dbgprint`
 
 Reverse-engineering convenience tools:
 
 - `windbg_set_breakpoint`
+- `windbg_set_hardware_breakpoint`
+- `windbg_trace_breakpoint`
 - `windbg_find_process`
 - `windbg_set_process_breakpoint`
 - `windbg_set_syscall_breakpoint`
 - `windbg_list_breakpoints`
 - `windbg_clear_breakpoint`
 - `windbg_continue_until_break`
+- `windbg_step`
+- `windbg_step_over`
+- `windbg_go_up`
 - `windbg_read_registers`
 - `windbg_write_register`
 - `windbg_read_memory`
@@ -243,8 +260,50 @@ Reverse-engineering convenience tools:
 - `windbg_set_driver_dispatch_breakpoints`
 - `windbg_driver_dispatch_snapshot`
 - `windbg_ioctl_snapshot`
+- `windbg_minifilter_message_snapshot`
 
-`windbg_close_session` tries to resume a broken target before teardown by default; pass `resume_before_close: false` to skip that behavior. For live kernel sessions, close waits briefly before detaching after either an automatic resume or a recently observed running state, so the guest has time to leave the break state. It also accepts an optional `shutdown_timeout_secs` value. The session is removed from the MCP registry first, and the bounded shutdown result reports whether dbgeng teardown completed cleanly or timed out in the background. This keeps live KDNET detach issues from hanging the MCP server.
+`windbg_execute_command` intentionally blocks raw `sxd ld*` commands in
+headless mode. Live testing showed this dbgeng path can access-violate after a
+driver load event and kill the stdio MCP process. Leave driver-load filters in
+the short-lived session, clear normal breakpoints with `windbg_clear_breakpoint`,
+then resume or close the session.
+
+`windbg_set_hardware_breakpoint` wraps WinDbg `ba` for execute/read/write/io
+hardware breakpoints and watchpoints. Use it for self-modifying code or code
+pages where software `bp` patching is unsafe. It supports byte sizes 1/2/4/8,
+one-shot/pass-count command strings, and optional `/p <EPROCESS>` /
+`/t <ETHREAD>` scoping.
+
+`windbg_continue_until_break` now confirms a short stable break window before
+returning by default. This avoids treating transient break states as usable
+command-ready stops. Tune `settle_millis` or set `require_stable_break: false`
+only for specialized experiments.
+
+`windbg_step`, `windbg_step_over`, and `windbg_go_up` issue `t`, `p`, and `gu`
+respectively, then poll execution state until a stable command-ready break is
+available. This avoids the raw `gu` behavior observed in live testing where the
+command returned immediately while the target was still running.
+
+Raw multi-register commands such as `r rip rax rcx` are blocked in
+`windbg_execute_command`; live testing showed this form can leave dbgeng in a
+transient `0x80040205` state. Use `windbg_read_registers` with a `registers`
+array instead. The MCP reads each requested register as an isolated command.
+
+For trace-style breakpoint logging, prefer `windbg_trace_breakpoint` over raw
+command breakpoints such as `bp addr ".echo ...; r; dd ...; g"`. The tool sets a
+temporary software or hardware breakpoint, resumes the target, waits for a
+stable stop, runs capture commands synchronously through MCP, then clears and
+resumes by default. This makes the captured registers/memory/backtrace part of
+the tool result instead of relying on asynchronous dbgeng output callbacks.
+
+For process-scoped user-mode virtual addresses, prefer hardware execute
+breakpoints: `windbg_set_hardware_breakpoint {"address":"<user-va>","pid":"...",
+"access":"execute","size":1}`. Live KDNET testing showed software
+`bp /p <EPROCESS> <user_va>` can create a breakpoint ID without hitting
+reliably, so `windbg_set_process_breakpoint` rejects low user-mode VA software
+breakpoints by default unless `allow_user_software:true` is provided.
+
+`windbg_close_session` tries to resume a broken target before teardown by default; pass `resume_before_close: false` to skip that behavior. For live kernel sessions, close now performs multiple short resume/state verification passes before detaching, so delayed reconnects that fall back into `break` are less likely to leave the VM paused. It also accepts an optional `shutdown_timeout_secs` value. The session is removed from the MCP registry first, and the bounded shutdown result reports whether dbgeng teardown completed cleanly or timed out in the background. This keeps live KDNET detach issues from hanging the MCP server.
 
 `windbg_recover_session` is the safe recovery shortcut for long-running KDNET work: by default it checks the session state and resumes a broken target, returning structured before/after state and any recovery error. Set `interrupt_if_running: true` when you intentionally want the recovery action to break into a running target instead.
 
@@ -272,6 +331,8 @@ Extension-backed commands still depend on symbols. Use `windbg_prepare_symbols` 
 
 If extension loading or an extension-backed command still fails, call `windbg_diagnose_extensions`. It collects the effective `.extpath`, loaded extension chain, optional symbol preparation, extension load output, probe command output, and remediation hints without requiring the client to manually stitch those checks together.
 
+Use `windbg_dbgprint` while the target is command-ready to retrieve kernel `DbgPrint` output through `!dbgprint`. The tool loads `kdexts` by default, returns a bounded tail (`lines`, default 200, max 5000), and only includes full raw output when `include_raw_output:true` is passed. If the extension reports symbol issues, retry with `prepare_symbols:true` or call `windbg_prepare_symbols {"module":"nt"}` first.
+
 ## What MCP Exposes
 
 - `Resources`: a low-context guide resource and compact/full WinDbg command documentation resources
@@ -279,9 +340,9 @@ If extension loading or an extension-backed command still fails, call `windbg_di
 
 Pure UI shortcut topics remain available as documentation, and command execution is exposed through a single `windbg_execute_command` tool.
 
-Recommended agent flow in headless mode: call `windbg_open_session`, optionally `windbg_switch_session`, then follow the same command flow. If extension commands need kernel symbols, call `windbg_prepare_symbols` while broken into the target, and use `windbg_diagnose_extensions` when `.load kdexts` or `!process` is not behaving as expected. If the debugger is running or busy, call `windbg_interrupt_target` explicitly and verify state again before executing the command. Use `windbg_resume_target` to continue execution without issuing a raw `g` command. Use `windbg_get_output` with the returned `next_cursor` to fetch only newly buffered command output.
+Recommended agent flow in headless mode: call `windbg_open_session`, optionally `windbg_switch_session`, then follow the same command flow. If extension commands need kernel symbols, call `windbg_prepare_symbols` while broken into the target, and use `windbg_diagnose_extensions` when `.load kdexts` or `!process` is not behaving as expected. Use `windbg_dbgprint` for recent kernel `DbgPrint` messages when the target is broken into a command-ready state. If the debugger is running or busy, call `windbg_interrupt_target` explicitly and verify state again before executing the command. Use `windbg_resume_target` to continue execution without issuing a raw `g` command. Use `windbg_get_output` with the returned `next_cursor` to fetch only newly buffered command output.
 
-Recommended breakpoint flow: call `windbg_set_breakpoint`, call `windbg_continue_until_break`, then call `windbg_breakpoint_snapshot` or targeted tools such as `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, and `windbg_backtrace`. For noisy kernel syscalls, call `windbg_find_process` and then `windbg_set_process_breakpoint` or `windbg_set_syscall_breakpoint`; these use WinDbg's native kernel `bp /p <EPROCESS>` support so `NtCreateFile` / `NtDeviceIoControlFile` tracing can be scoped to `ShadowGateApp.exe`, `maze_probe.exe`, or a specific PID.
+Recommended breakpoint flow: call `windbg_set_breakpoint` or `windbg_set_hardware_breakpoint`, call `windbg_continue_until_break`, then call `windbg_breakpoint_snapshot` or targeted tools such as `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, and `windbg_backtrace`. For one-shot trace logging, call `windbg_trace_breakpoint` instead; it owns set/resume/wait/capture/cleanup in one MCP call. For noisy kernel syscalls, call `windbg_find_process` and then `windbg_set_process_breakpoint` or `windbg_set_syscall_breakpoint`; these use WinDbg's native kernel `bp /p <EPROCESS>` support so `NtCreateFile` / `NtDeviceIoControlFile` tracing can be scoped to `ShadowGateApp.exe`, `maze_probe.exe`, or a specific PID. Use `windbg_step`, `windbg_step_over`, or `windbg_go_up` for instruction-level dynamic reversing while keeping the MCP from returning until the temporary step stop is usable.
 
 Recommended kernel-driver flow: call `windbg_set_driver_load_breakpoint` before starting the driver; it prepares `nt` symbols by default before configuring `sxe ld:<image>` so later driver-object inspection avoids dbgeng's unstable "prepare symbols after load-filter mutation" path. Continue until the load event, then call `windbg_driver_summary` to collect `lm`, `!drvobj`, object/device checks, and parsed `IRP_MJ_*` dispatch routines. Use `windbg_set_driver_dispatch_breakpoints` to place breakpoints on dispatch handlers such as `IRP_MJ_DEVICE_CONTROL`, then use `windbg_driver_dispatch_snapshot` at dispatch entry or `windbg_ioctl_snapshot` at IOCTL-specific breakpoints to collect registers, `!irp`, parsed IOCTL input/output lengths and code, SystemBuffer memory and byte prefix, stack, RIP disassembly, and current breakpoints. `windbg_ioctl_snapshot` auto-detects common IRP registers by default, which helps when a handler has cached the IRP after the normal dispatch entry. Use `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for lower-level symbol/module/driver-object checks.
 
@@ -296,6 +357,13 @@ Run the stdio smoke helper after building the release binary:
 
 ```powershell
 python tools/headless_mcp_smoke.py
+```
+
+Live KDNET regression helpers are available for deeper checks:
+
+```powershell
+python tools/headless_trace_breakpoint_smoke.py --connection "<kdnet>" --location "<addr-or-symbol>"
+python tools/headless_user_va_breakpoint_smoke.py --connection "<kdnet>" --process-name "<app.exe>" --location "<user-va>"
 ```
 
 To validate a live KDNET session, pass your own connection string:

@@ -2034,17 +2034,32 @@ mod windows_impl {
             Ok(captured.lock().expect("buffer lock poisoned").clone())
         }
 
-        fn wait_until_ready_for_commands(
+        fn request_interrupt_signal(&self) -> Result<(), ExecutionError> {
+            if let Some(host) = &self.kernel_host {
+                host.request_active_interrupt();
+                Ok(())
+            } else {
+                let control = self.control();
+                unsafe {
+                    control
+                        .SetInterrupt(DEBUG_INTERRUPT_ACTIVE)
+                        .map_err(|error| ExecutionError::Command(error.to_string()))
+                }
+            }
+        }
+
+        fn wait_until_ready_after_interrupt(
             &mut self,
         ) -> Result<DebuggerExecutionState, ExecutionError> {
             let deadline = Instant::now() + INTERRUPT_WAIT_TIMEOUT;
+            let mut next_interrupt = Instant::now() + Duration::from_secs(1);
             loop {
                 let state = self.refresh_state()?;
                 tracing::trace!(
                     status = state.raw_status,
                     name = %state.status_name,
                     ready = state.ready_for_commands,
-                    "waiting for debugger to become ready"
+                    "waiting for debugger to become ready after interrupt"
                 );
                 if state.ready_for_commands {
                     self.maybe_run_startup_command()?;
@@ -2056,6 +2071,16 @@ mod windows_impl {
                         "timed out waiting for debugger to become ready; last status was {} ({})",
                         state.status_name, state.raw_status
                     )));
+                }
+
+                if Instant::now() >= next_interrupt {
+                    tracing::debug!(
+                        status = state.raw_status,
+                        name = %state.status_name,
+                        "debugger is still running after interrupt; reissuing break-in request"
+                    );
+                    self.request_interrupt_signal()?;
+                    next_interrupt = Instant::now() + Duration::from_secs(1);
                 }
 
                 thread::sleep(POLL_INTERVAL);
@@ -2197,18 +2222,9 @@ mod windows_impl {
                 return Ok(state);
             }
 
-            if let Some(host) = &self.kernel_host {
-                host.request_active_interrupt();
-            } else {
-                let control = self.control();
-                unsafe {
-                    control
-                        .SetInterrupt(DEBUG_INTERRUPT_ACTIVE)
-                        .map_err(|error| ExecutionError::Command(error.to_string()))?;
-                }
-            }
+            self.request_interrupt_signal()?;
 
-            self.wait_until_ready_for_commands()
+            self.wait_until_ready_after_interrupt()
         }
 
         fn resume(&mut self) -> Result<DebuggerExecutionState, ExecutionError> {
