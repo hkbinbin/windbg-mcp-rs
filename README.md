@@ -209,11 +209,88 @@ windbg_close_session {"session_id":"kdnet-main"}
 
 `windbg_close_session` resumes a broken kernel target before detach by default so the VM is not left paused.
 
+## User-Mode Debugging
+
+The same headless server also debugs local Windows user-mode processes through
+the new `windbg_open_user_process` MCP tool (or `--launch-user` /
+`--attach-user-pid` on the command line). Sessions opened this way share the
+catalog, breakpoint, register, memory, disassembly and stepping tools with
+kernel sessions; only the underlying dbgeng attach path differs.
+
+### Spawn A Debuggee From MCP
+
+```json
+{
+  "command_line": "C:\\path\\to\\app.exe arg1 arg2",
+  "session_id": "user-main",
+  "only_this_process": true,
+  "detach_on_exit": true,
+  "attach_timeout_secs": 30
+}
+```
+
+with tool:
+
+```text
+windbg_open_user_process
+```
+
+The engine sets `DEBUG_ENGOPT_INITIAL_BREAK`, so the session enters `break`
+right after the loader maps `ntdll`. From there standard reverse-engineering
+tools work the same as for kernel sessions.
+
+### Attach To An Existing PID
+
+```json
+{
+  "pid": 4242,
+  "session_id": "user-attach",
+  "non_invasive": false,
+  "detach_on_exit": true
+}
+```
+
+`non_invasive: true` issues
+`DEBUG_ATTACH_NONINVASIVE | DEBUG_ATTACH_NONINVASIVE_NO_SUSPEND`, useful for
+read-only inspection of a sensitive process.
+
+### Run From The Command Line
+
+```powershell
+target\release\windbg_mcp_headless.exe --launch-user "C:\path\to\app.exe"
+target\release\windbg_mcp_headless.exe --attach-user-pid 4242
+target\release\windbg_mcp_headless.exe --attach-user-pid 4242 --user-non-invasive
+```
+
+By default the spawned debuggee detaches when the session ends. Pass
+`--user-terminate-on-exit` to terminate it instead.
+
+### Smoke Test
+
+`tools/headless_user_mode_smoke.py` exercises the new path end-to-end:
+
+```powershell
+python tools\headless_user_mode_smoke.py --target C:\path\to\Crackme.exe --terminate-on-exit
+```
+
+It launches the binary, waits for the loader breakpoint, runs a small command
+suite (`.lastevent`, `vertarget`, `|.`, `lm m *`, `r`, `k`, `.symfix`), and
+closes the session.
+
+### User-Mode VA Software Breakpoints
+
+`windbg_set_process_breakpoint` automatically allows software `bp /p <EPROCESS>
+<user_va>` for sessions opened via `windbg_open_user_process`. The KDNET-only
+guard that recommends `windbg_set_hardware_breakpoint` instead is disabled
+when the active session is a user-mode session because plain `bp` is reliable
+on a local user-mode debug port.
+
 ## Headless Session Tools
 
 Headless mode adds session-management tools:
 
 - `windbg_open_session`
+- `windbg_open_user_process`
 - `windbg_close_session`
 - `windbg_switch_session`
 - `windbg_list_sessions`

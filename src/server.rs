@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{
     catalog::{Catalog, CatalogEntry, CatalogResourceKind, CatalogSection},
-    executor::{CommandDispatcher, CommandExecutionResult, ExecutionError},
+    executor::{CommandDispatcher, CommandExecutionResult, ExecutionError, UserModeAttach},
     resources::{GUIDE_URI, render_compact_command, render_full_command, render_guide},
     session_manager::HeadlessSessionManager,
 };
@@ -362,6 +362,41 @@ struct OpenSessionArgs {
     connection: String,
     session_id: Option<String>,
     startup_command: Option<String>,
+    attach_timeout_secs: Option<u64>,
+}
+
+/// Arguments for `windbg_open_user_process`.
+///
+/// Provide either `command_line` (to spawn a new debuggee) or `pid` (to
+/// attach to a running process). The two are mutually exclusive.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct OpenUserSessionArgs {
+    /// Optional explicit session id. When omitted a `user-NN` id is
+    /// generated automatically.
+    session_id: Option<String>,
+    /// Path or full command line for the executable to launch as the
+    /// debuggee. Required when `pid` is not supplied. The first
+    /// whitespace-separated token must be an executable resolvable on the
+    /// host.
+    command_line: Option<String>,
+    /// Existing process id to attach to. Required when `command_line` is
+    /// not supplied.
+    pid: Option<u32>,
+    /// When true (default), the engine debugs only the spawned process
+    /// (`DEBUG_PROCESS_ONLY_THIS_PROCESS`). Ignored for `pid` attaches.
+    only_this_process: Option<bool>,
+    /// When true (default), the debuggee is detached automatically when
+    /// the headless session ends (`DEBUG_PROCESS_DETACH_ON_EXIT`); when
+    /// false, the debuggee is terminated on session close.
+    detach_on_exit: Option<bool>,
+    /// When true, perform a non-invasive attach (`DEBUG_ATTACH_NONINVASIVE
+    /// | DEBUG_ATTACH_NONINVASIVE_NO_SUSPEND`). Only used for `pid`
+    /// attaches.
+    non_invasive: Option<bool>,
+    /// Optional debugger command run right after the initial break, for
+    /// example `.symfix; .reload`.
+    startup_command: Option<String>,
+    /// Override the attach timeout; defaults to the standard timeout.
     attach_timeout_secs: Option<u64>,
 }
 
@@ -897,6 +932,38 @@ fn looks_like_user_mode_address(value: &str) -> bool {
         return false;
     };
     address != 0 && address < 0x0000_8000_0000_0000
+}
+
+fn build_user_mode_attach(args: &OpenUserSessionArgs) -> Result<UserModeAttach, McpError> {
+    let command_line = args
+        .command_line
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let only_this_process = args.only_this_process.unwrap_or(true);
+    let detach_on_exit = args.detach_on_exit.unwrap_or(true);
+    let non_invasive = args.non_invasive.unwrap_or(false);
+
+    match (command_line, args.pid) {
+        (Some(_), Some(_)) => Err(McpError::invalid_params(
+            "specify either `command_line` (to spawn a debuggee) or `pid` (to attach to a running process), not both",
+            None,
+        )),
+        (None, None) => Err(McpError::invalid_params(
+            "either `command_line` or `pid` must be supplied",
+            None,
+        )),
+        (Some(command_line), None) => Ok(UserModeAttach::Launch {
+            command_line: command_line.to_string(),
+            only_this_process,
+            detach_on_exit,
+        }),
+        (None, Some(pid)) => Ok(UserModeAttach::AttachPid {
+            pid,
+            non_invasive,
+            detach_on_exit,
+        }),
+    }
 }
 
 fn default_trace_commands() -> Vec<String> {
@@ -1653,6 +1720,15 @@ impl WindbgMcpServer {
         .with_title("Open headless session")
     }
 
+    fn open_user_session_tool(&self) -> Tool {
+        Tool::new(
+            "windbg_open_user_process",
+            "Open a headless user-mode debugging session. Either spawn a new debuggee with `command_line` (the same format used for `windbg.exe <args>`) or attach to a running process with `pid`. Use this to debug local Windows user-mode binaries (.exe) without setting up a kernel target. Optional flags `only_this_process`, `detach_on_exit`, `non_invasive` mirror the underlying dbgeng `DEBUG_PROCESS_*` / `DEBUG_ATTACH_*` constants.",
+            schema_for_type::<OpenUserSessionArgs>(),
+        )
+        .with_title("Open user-mode debug session")
+    }
+
     fn close_session_tool(&self) -> Tool {
         Tool::new(
             "windbg_close_session",
@@ -1757,6 +1833,7 @@ impl WindbgMcpServer {
 
         vec![
             self.open_session_tool(),
+            self.open_user_session_tool(),
             self.close_session_tool(),
             self.switch_session_tool(),
             self.list_sessions_tool(),
@@ -2453,13 +2530,22 @@ impl WindbgMcpServer {
     ) -> Result<Value, McpError> {
         let (mut steps, process, candidates) = self.resolve_process_for_breakpoint(&args).await?;
         let user_mode_address = looks_like_user_mode_address(&args.location);
-        if user_mode_address && !args.allow_user_software.unwrap_or(false) {
+        let in_user_mode_session = match &self.backend {
+            ServerBackend::Headless { sessions } => {
+                sessions.is_user_mode_session(args.session_id.as_deref())
+            }
+            ServerBackend::AttachedSession { .. } => false,
+        };
+        if user_mode_address
+            && !in_user_mode_session
+            && !args.allow_user_software.unwrap_or(false)
+        {
             return Err(McpError::invalid_params(
-                "software `bp /p <EPROCESS> <user_va>` can create a breakpoint ID without hitting reliably in live KDNET headless sessions. Use `windbg_set_hardware_breakpoint` with `access: execute`, `size: 1`, and the same process selector, or pass `allow_user_software: true` for an explicit experiment.",
+                "software `bp /p <EPROCESS> <user_va>` can create a breakpoint ID without hitting reliably in live KDNET headless sessions. Use `windbg_set_hardware_breakpoint` with `access: execute`, `size: 1`, and the same process selector, or pass `allow_user_software: true` for an explicit experiment. (For local user-mode sessions opened with `windbg_open_user_process`, software breakpoints are reliable and this guard is bypassed automatically.)",
                 None,
             ));
         }
-        let set_context = args.set_context.unwrap_or(user_mode_address);
+        let set_context = args.set_context.unwrap_or(user_mode_address && !in_user_mode_session);
         if set_context {
             let context_command = format!(".process /p /r {}", process.eprocess);
             let context = self
@@ -3912,7 +3998,7 @@ impl WindbgMcpServer {
 impl ServerHandler for WindbgMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.is_headless() {
-            "Open a session with `windbg_open_session` before using debugger actions. Use `windbg_set_breakpoint`, `windbg_set_hardware_breakpoint`, `windbg_trace_breakpoint`, `windbg_find_process`, `windbg_set_process_breakpoint`, `windbg_set_syscall_breakpoint`, `windbg_set_driver_load_breakpoint`, `windbg_driver_summary`, `windbg_set_driver_dispatch_breakpoints`, `windbg_driver_dispatch_snapshot`, `windbg_ioctl_snapshot`, `windbg_minifilter_message_snapshot`, `windbg_dbgprint`, `windbg_continue_until_break`, `windbg_step`, `windbg_step_over`, `windbg_go_up`, `windbg_breakpoint_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common reverse-engineering and kernel-driver flows. Use `windbg_execute_command` for raw WinDbg commands, `windbg_get_output` with cursors for buffered output, and `windbg_resume_target` to continue a live target without blocking on raw `g`. Use `windbg_recover_session` if a live KDNET target may have been left broken. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
+            "Open a session with `windbg_open_session` (kernel debugging) or `windbg_open_user_process` (local user-mode debugging by spawning a binary or attaching to a PID) before using debugger actions. Use `windbg_set_breakpoint`, `windbg_set_hardware_breakpoint`, `windbg_trace_breakpoint`, `windbg_find_process`, `windbg_set_process_breakpoint`, `windbg_set_syscall_breakpoint`, `windbg_set_driver_load_breakpoint`, `windbg_driver_summary`, `windbg_set_driver_dispatch_breakpoints`, `windbg_driver_dispatch_snapshot`, `windbg_ioctl_snapshot`, `windbg_minifilter_message_snapshot`, `windbg_dbgprint`, `windbg_continue_until_break`, `windbg_step`, `windbg_step_over`, `windbg_go_up`, `windbg_breakpoint_snapshot`, `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, `windbg_backtrace`, `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for common reverse-engineering, user-mode and kernel-driver flows. Use `windbg_execute_command` for raw WinDbg commands, `windbg_get_output` with cursors for buffered output, and `windbg_resume_target` to continue a live target without blocking on raw `g`. Use `windbg_recover_session` if a live KDNET target may have been left broken. When multiple sessions are open, pass `session_id` or set a default with `windbg_switch_session`."
         } else {
             "This server is organized around low-context resources plus a small toolset. Start with `windbg_search_catalog`, read `windbg://command/{id}`, optionally escalate to `windbg://command-full/{id}`, then call `windbg_get_execution_state`. If the debugger is running or busy, call `windbg_interrupt_target` and verify state again before calling `windbg_execute_command`. Use `windbg_get_output` to read buffered command output again later, and `windbg_resume_target` to continue execution without issuing a raw `g` command."
         };
@@ -3983,6 +4069,9 @@ impl ServerHandler for WindbgMcpServer {
             "windbg_interrupt_target" => Some(self.interrupt_tool()),
             "windbg_resume_target" => Some(self.resume_tool()),
             "windbg_open_session" if self.is_headless() => Some(self.open_session_tool()),
+            "windbg_open_user_process" if self.is_headless() => {
+                Some(self.open_user_session_tool())
+            }
             "windbg_close_session" if self.is_headless() => Some(self.close_session_tool()),
             "windbg_switch_session" if self.is_headless() => Some(self.switch_session_tool()),
             "windbg_list_sessions" if self.is_headless() => Some(self.list_sessions_tool()),
@@ -4229,6 +4318,25 @@ impl ServerHandler for WindbgMcpServer {
                 let session = sessions
                     .open_kernel_session(
                         &args.connection,
+                        args.session_id.as_deref(),
+                        args.startup_command.as_deref(),
+                        args.attach_timeout_secs,
+                    )
+                    .await
+                    .map_err(Self::map_execution_error)?;
+                Ok(CallToolResult::structured(json!({
+                    "session": session
+                })))
+            }
+            "windbg_open_user_process" => {
+                let ServerBackend::Headless { sessions } = &self.backend else {
+                    return Err(McpError::method_not_found::<CallToolRequestMethod>());
+                };
+                let args: OpenUserSessionArgs = self.parse_arguments(request.arguments)?;
+                let attach = build_user_mode_attach(&args)?;
+                let session = sessions
+                    .open_user_process_session(
+                        attach,
                         args.session_id.as_deref(),
                         args.startup_command.as_deref(),
                         args.attach_timeout_secs,

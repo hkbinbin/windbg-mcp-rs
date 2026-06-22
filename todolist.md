@@ -189,3 +189,20 @@
 
 - [x] Remove legacy GUI/plugin-facing project surface.
   Removed the WinDbg extension DLL entrypoints, in-process plugin server, cdylib build target, and README/plugin screenshot workflow. The maintained binary is now `windbg_mcp_headless`.
+
+## P1 User-Mode Debugging
+
+- [x] Add first-class headless user-mode debugging support.
+  Added an `ExecutionMode::UserModeProcess` variant backed by a new
+  `UserModeAttach` enum that supports both `CreateProcessAndAttachWide`
+  spawn-and-attach and `AttachProcess` PID attaches. The kernel session host
+  was generalized to a `HostAttachKind` so kernel and user-mode sessions
+  share the dbgeng command/event plumbing, including event callbacks,
+  initial-break suppression and command-window retry. Exposed through the
+  new `windbg_open_user_process` MCP tool and `--launch-user` /
+  `--attach-user-pid` CLI flags. `windbg_set_process_breakpoint` now allows
+  software `bp /p <EPROCESS> <user_va>` for user-mode sessions because
+  software breakpoints are reliable on a local user-mode debug port.
+  Verified end-to-end with `tools/headless_user_mode_smoke.py` against
+  `Crackme.exe` (32-bit launch with WoW64 module list, registers, stack
+  backtrace) and against an existing notepad PID (`AttachPid` path).

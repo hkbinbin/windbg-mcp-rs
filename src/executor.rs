@@ -60,9 +60,67 @@ pub enum ExecutionMode {
         startup_command: Option<String>,
         attach_timeout: Duration,
     },
+    UserModeProcess {
+        attach: UserModeAttach,
+        startup_command: Option<String>,
+        attach_timeout: Duration,
+    },
     Mock {
         responses: HashMap<String, String>,
     },
+}
+
+/// How to acquire a user-mode process for debugging.
+#[derive(Debug, Clone)]
+pub enum UserModeAttach {
+    /// Spawn the given command line as a debuggee process and immediately
+    /// attach. The first whitespace-separated token must be an executable
+    /// path or name resolvable through the launcher's PATH.
+    Launch {
+        command_line: String,
+        /// When true, only the spawned process is debugged (the engine sets
+        /// `DEBUG_PROCESS_ONLY_THIS_PROCESS`); when false the engine follows
+        /// child processes too.
+        only_this_process: bool,
+        /// When true, the debuggee is detached automatically when the host
+        /// session ends instead of being terminated.
+        detach_on_exit: bool,
+    },
+    /// Attach to a process that is already running on the local machine,
+    /// addressed by its decimal PID.
+    AttachPid {
+        pid: u32,
+        /// When true, performs a `DEBUG_ATTACH_NONINVASIVE` attach (no
+        /// debug heap injection, freezes threads on the target).
+        non_invasive: bool,
+        /// When true, the debuggee is detached on session shutdown.
+        detach_on_exit: bool,
+    },
+}
+
+impl UserModeAttach {
+    /// Stable string used as the `connection_options` in session info and as
+    /// the deduplication key in the session registry.
+    pub fn connection_key(&self) -> String {
+        match self {
+            UserModeAttach::Launch {
+                command_line,
+                only_this_process,
+                detach_on_exit,
+            } => {
+                format!(
+                    "user-launch:only_this_process={only_this_process};detach_on_exit={detach_on_exit};cmd={command_line}"
+                )
+            }
+            UserModeAttach::AttachPid {
+                pid,
+                non_invasive,
+                detach_on_exit,
+            } => format!(
+                "user-attach:pid={pid};non_invasive={non_invasive};detach_on_exit={detach_on_exit}"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -624,6 +682,25 @@ fn build_executor(mode: ExecutionMode) -> Result<Box<dyn BlockingExecutor>, Exec
                 Err(ExecutionError::WindowsOnly)
             }
         }
+        ExecutionMode::UserModeProcess {
+            attach,
+            startup_command,
+            attach_timeout,
+        } => {
+            #[cfg(windows)]
+            {
+                Ok(Box::new(DbgEngExecutor::attach_user_process(
+                    attach,
+                    startup_command.as_deref(),
+                    attach_timeout,
+                )?))
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (attach, startup_command, attach_timeout);
+                Err(ExecutionError::WindowsOnly)
+            }
+        }
     }
 }
 
@@ -676,10 +753,12 @@ mod windows_impl {
 
     use windows::{
         Win32::System::Diagnostics::Debug::Extensions::{
-            DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_CONNECT_SESSION_NO_ANNOUNCE,
+            DEBUG_ATTACH_DEFAULT, DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_ATTACH_NONINVASIVE,
+            DEBUG_ATTACH_NONINVASIVE_NO_SUSPEND, DEBUG_CONNECT_SESSION_NO_ANNOUNCE,
             DEBUG_CONNECT_SESSION_NO_VERSION, DEBUG_ENGOPT_INITIAL_BREAK, DEBUG_EXECUTE_DEFAULT,
             DEBUG_INTERRUPT_ACTIVE, DEBUG_INTERRUPT_EXIT, DEBUG_INTERRUPT_PASSIVE,
-            DEBUG_OUTCTL_THIS_CLIENT, DEBUG_STATUS_GO_HANDLED, IDebugClient, IDebugClient5,
+            DEBUG_OUTCTL_THIS_CLIENT, DEBUG_PROCESS_DETACH_ON_EXIT,
+            DEBUG_PROCESS_ONLY_THIS_PROCESS, DEBUG_STATUS_GO_HANDLED, IDebugClient, IDebugClient5,
             IDebugControl, IDebugDataSpaces, IDebugOutputCallbacks, IDebugOutputCallbacks_Impl,
             IDebugRegisters, IDebugSymbols3, IDebugSystemObjects3,
         },
@@ -693,6 +772,7 @@ mod windows_impl {
 
     use super::{
         BlockingExecutor, CString, DebuggerExecutionState, ExecutionError, INTERRUPT_WAIT_TIMEOUT,
+        UserModeAttach,
     };
     use crate::headless::{HeadlessEventCallbacks, HeadlessEventControl};
 
@@ -873,11 +953,90 @@ mod windows_impl {
         }
     }
 
+    /// What kind of dbgeng session the host should establish.
+    #[derive(Clone)]
+    enum HostAttachKind {
+        /// Kernel debugging via `AttachKernelWide` (KDNET, COM, etc.).
+        Kernel { connect_options: String },
+        /// User-mode debugging via `CreateProcessAndAttachWide` /
+        /// `AttachProcess`.
+        UserMode {
+            attach: UserModeAttach,
+            // Pre-computed attach flag bits (DEBUG_ATTACH_*) for `AttachPid`
+            // or process create flags (DEBUG_PROCESS_*) for `Launch`.
+            attach_flags: u32,
+            create_flags: u32,
+        },
+    }
+
+    impl HostAttachKind {
+        fn label(&self) -> &'static str {
+            match self {
+                HostAttachKind::Kernel { .. } => "kernel",
+                HostAttachKind::UserMode { .. } => "user",
+            }
+        }
+
+        fn description(&self) -> String {
+            match self {
+                HostAttachKind::Kernel { connect_options } => {
+                    format!("kernel:{connect_options}")
+                }
+                HostAttachKind::UserMode { attach, .. } => attach.connection_key(),
+            }
+        }
+    }
+
+    fn build_user_mode_attach_kind(attach: &UserModeAttach) -> HostAttachKind {
+        match attach {
+            UserModeAttach::Launch {
+                only_this_process,
+                detach_on_exit,
+                ..
+            } => {
+                let mut create_flags: u32 = 0;
+                if *only_this_process {
+                    create_flags |= DEBUG_PROCESS_ONLY_THIS_PROCESS;
+                }
+                if *detach_on_exit {
+                    create_flags |= DEBUG_PROCESS_DETACH_ON_EXIT;
+                }
+                HostAttachKind::UserMode {
+                    attach: attach.clone(),
+                    attach_flags: DEBUG_ATTACH_DEFAULT,
+                    create_flags,
+                }
+            }
+            UserModeAttach::AttachPid {
+                non_invasive,
+                detach_on_exit,
+                ..
+            } => {
+                let attach_flags = if *non_invasive {
+                    DEBUG_ATTACH_NONINVASIVE | DEBUG_ATTACH_NONINVASIVE_NO_SUSPEND
+                } else {
+                    DEBUG_ATTACH_DEFAULT
+                };
+                let create_flags = if *detach_on_exit {
+                    DEBUG_PROCESS_DETACH_ON_EXIT
+                } else {
+                    0
+                };
+                HostAttachKind::UserMode {
+                    attach: attach.clone(),
+                    attach_flags,
+                    create_flags,
+                }
+            }
+        }
+    }
+
     struct KernelSessionHost {
         stop_requested: Arc<AtomicBool>,
         interrupt_control: CrossThreadInterruptControl,
         command_tx: mpsc::Sender<HostCommand>,
         terminal_error: Arc<Mutex<Option<String>>>,
+        kind_label: &'static str,
         _join_handle: thread::JoinHandle<()>,
     }
 
@@ -888,7 +1047,22 @@ mod windows_impl {
 
     impl KernelSessionHost {
         fn start(connect_options: &str) -> Result<Self, ExecutionError> {
-            let options = connect_options.to_string();
+            Self::start_with_kind(HostAttachKind::Kernel {
+                connect_options: connect_options.to_string(),
+            })
+        }
+
+        fn start_user_mode(attach: &UserModeAttach) -> Result<Self, ExecutionError> {
+            Self::start_with_kind(build_user_mode_attach_kind(attach))
+        }
+
+        fn start_with_kind(attach_kind: HostAttachKind) -> Result<Self, ExecutionError> {
+            let kind_label = attach_kind.label();
+            tracing::debug!(
+                kind = kind_label,
+                target = %attach_kind.description(),
+                "spawning headless dbgeng host"
+            );
             let stop_requested = Arc::new(AtomicBool::new(false));
             let stop_for_thread = stop_requested.clone();
             let (ready_tx, ready_rx) =
@@ -898,14 +1072,14 @@ mod windows_impl {
             let event_control_for_thread = event_control.clone();
             let terminal_error = Arc::new(Mutex::new(None));
             let terminal_error_for_thread = terminal_error.clone();
+            let attach_kind_for_thread = attach_kind;
 
             let join_handle = thread::Builder::new()
-                .name("windbg-mcp-kernel-host".to_string())
+                .name(format!("windbg-mcp-{kind_label}-host"))
                 .spawn(move || {
                     let startup = || -> Result<(), ExecutionError> {
                         let client5 = debug_create::<IDebugClient5>()
                             .map_err(|error| ExecutionError::Startup(error.to_string()))?;
-                        let options = HSTRING::from(options);
                         let initial_control = client5
                             .cast::<IDebugControl>()
                             .map_err(|error| ExecutionError::Startup(error.to_string()))?;
@@ -915,14 +1089,83 @@ mod windows_impl {
                                 .AddEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK)
                                 .map_err(|error| ExecutionError::Startup(error.to_string()))?;
                         }
-                        tracing::debug!("kernel host enabled DEBUG_ENGOPT_INITIAL_BREAK");
+                        tracing::debug!(
+                            kind = kind_label,
+                            "session host enabled DEBUG_ENGOPT_INITIAL_BREAK"
+                        );
 
-                        unsafe {
-                            client5
-                                .AttachKernelWide(DEBUG_ATTACH_KERNEL_CONNECTION, &options)
-                                .map_err(|error| ExecutionError::Startup(error.to_string()))?;
+                        match &attach_kind_for_thread {
+                            HostAttachKind::Kernel { connect_options } => {
+                                let options = HSTRING::from(connect_options.as_str());
+                                unsafe {
+                                    client5
+                                        .AttachKernelWide(
+                                            DEBUG_ATTACH_KERNEL_CONNECTION,
+                                            &options,
+                                        )
+                                        .map_err(|error| {
+                                            ExecutionError::Startup(error.to_string())
+                                        })?;
+                                }
+                                tracing::info!(
+                                    options = %options,
+                                    "kernel host attached transport"
+                                );
+                            }
+                            HostAttachKind::UserMode {
+                                attach,
+                                attach_flags,
+                                create_flags,
+                            } => match attach {
+                                UserModeAttach::Launch { command_line, .. } => {
+                                    let command_line_w = HSTRING::from(command_line.as_str());
+                                    tracing::info!(
+                                        command_line = %command_line,
+                                        create_flags = format!("0x{create_flags:x}"),
+                                        attach_flags = format!("0x{attach_flags:x}"),
+                                        "user host spawning debuggee process"
+                                    );
+                                    unsafe {
+                                        client5
+                                            .CreateProcessAndAttachWide(
+                                                0,
+                                                &command_line_w,
+                                                *create_flags,
+                                                0,
+                                                *attach_flags,
+                                            )
+                                            .map_err(|error| {
+                                                ExecutionError::Startup(format!(
+                                                    "failed to launch user-mode debuggee `{command_line}`: {error}"
+                                                ))
+                                            })?;
+                                    }
+                                }
+                                UserModeAttach::AttachPid { pid, .. } => {
+                                    if *create_flags != 0 {
+                                        unsafe {
+                                            client5
+                                                .SetProcessOptions(*create_flags)
+                                                .map_err(|error| ExecutionError::Startup(format!(
+                                                    "failed to set process options 0x{create_flags:x}: {error}"
+                                                )))?;
+                                        }
+                                    }
+                                    tracing::info!(
+                                        pid = *pid,
+                                        attach_flags = format!("0x{attach_flags:x}"),
+                                        "user host attaching to existing process"
+                                    );
+                                    unsafe {
+                                        client5
+                                            .AttachProcess(0, *pid, *attach_flags)
+                                            .map_err(|error| ExecutionError::Startup(format!(
+                                                "failed to attach to PID {pid}: {error}"
+                                            )))?;
+                                    }
+                                }
+                            },
                         }
-                        tracing::info!(options = %options, "kernel host attached transport");
 
                         let client = client5
                             .cast::<IDebugClient>()
@@ -1152,8 +1395,13 @@ mod windows_impl {
                 interrupt_control,
                 command_tx,
                 terminal_error,
+                kind_label,
                 _join_handle: join_handle,
             })
+        }
+
+        fn kind_label(&self) -> &'static str {
+            self.kind_label
         }
 
         fn worker_stopped_error(&self) -> ExecutionError {
@@ -1914,14 +2162,35 @@ mod windows_impl {
         ) -> Result<Self, ExecutionError> {
             tracing::debug!(%connect_options, ?attach_timeout, "starting kernel host thread");
             let host = KernelSessionHost::start(connect_options)?;
+            Self::connect_command_client(host, startup_command, attach_timeout)
+        }
+
+        pub(crate) fn attach_user_process(
+            attach: UserModeAttach,
+            startup_command: Option<&str>,
+            attach_timeout: Duration,
+        ) -> Result<Self, ExecutionError> {
+            tracing::debug!(?attach, ?attach_timeout, "starting user-mode host thread");
+            let host = KernelSessionHost::start_user_mode(&attach)?;
+            Self::connect_command_client(host, startup_command, attach_timeout)
+        }
+
+        fn connect_command_client(
+            host: KernelSessionHost,
+            startup_command: Option<&str>,
+            attach_timeout: Duration,
+        ) -> Result<Self, ExecutionError> {
+            let kind_label = host.kind_label();
             let connect_deadline = Instant::now() + attach_timeout.max(Duration::from_secs(5));
 
             loop {
                 match Self::connect_session() {
                     Ok(mut executor) => {
-                        // The host client owns the KDNET transport. Calling EndSession from this
-                        // connected command client can trip dbgeng's nested LoadModule guard during
-                        // driver-load events, so cleanup is handled by stopping the host client.
+                        // The host client owns the underlying transport (KDNET, COM, or
+                        // local user-mode debug port). Calling EndSession from this
+                        // connected command client can trip dbgeng's nested LoadModule guard
+                        // during driver-load or module-load events, so cleanup is handled by
+                        // stopping the host client.
                         executor.pending_startup_command = startup_command
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
@@ -1930,16 +2199,17 @@ mod windows_impl {
                         executor.last_known_state = executor.refresh_state()?;
                         executor.maybe_run_startup_command()?;
                         tracing::debug!(
+                            kind = kind_label,
                             state = %executor.last_known_state.status_name,
-                            "connected command client to kernel host session"
+                            "connected command client to dbgeng host session"
                         );
                         return Ok(executor);
                     }
                     Err(error) => {
                         if Instant::now() >= connect_deadline {
-                            // The host owns the KDNET transport as soon as AttachKernelWide
-                            // succeeds. If the command client never connects, do not leave an
-                            // unregistered host waiting for a later VM reconnect.
+                            // The host owns the transport as soon as Attach* succeeds.
+                            // If the command client never connects, do not leave an
+                            // unregistered host running.
                             host.request_stop();
                             return Err(error);
                         }

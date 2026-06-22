@@ -45,12 +45,13 @@ def print_command_result(command: str, result: dict[str, Any], max_chars: int | 
 
 
 class McpStdioClient:
-    def __init__(self, exe: Path) -> None:
+    def __init__(self, exe: Path, forward_stderr: bool = False) -> None:
+        stderr = None if forward_stderr else subprocess.PIPE
         self.proc = subprocess.Popen(
             [str(exe)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=stderr,
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -228,6 +229,72 @@ def open_kernel_session(
     print("opening:", redact(connection))
     session = client.call_tool(
         "windbg_open_session",
+        arguments,
+        timeout_secs=attach_timeout_secs + 20,
+    )["session"]
+    opened_session_id = session["session_id"]
+    state = session.get("state") or {}
+    print("opened:", opened_session_id, state_name(state))
+    return opened_session_id
+
+
+def open_user_launch_session(
+    client: McpStdioClient,
+    command_line: str,
+    session_id: str | None,
+    attach_timeout_secs: int,
+    only_this_process: bool = True,
+    detach_on_exit: bool = True,
+    startup_command: str | None = None,
+) -> str:
+    """Spawn `command_line` under dbgeng control via `windbg_open_user_process`."""
+    arguments: dict[str, Any] = {
+        "command_line": command_line,
+        "only_this_process": only_this_process,
+        "detach_on_exit": detach_on_exit,
+        "attach_timeout_secs": attach_timeout_secs,
+    }
+    if session_id:
+        arguments["session_id"] = session_id
+    if startup_command:
+        arguments["startup_command"] = startup_command
+
+    print("launching user-mode debuggee:", command_line)
+    session = client.call_tool(
+        "windbg_open_user_process",
+        arguments,
+        timeout_secs=attach_timeout_secs + 20,
+    )["session"]
+    opened_session_id = session["session_id"]
+    state = session.get("state") or {}
+    print("opened:", opened_session_id, state_name(state))
+    return opened_session_id
+
+
+def open_user_attach_session(
+    client: McpStdioClient,
+    pid: int,
+    session_id: str | None,
+    attach_timeout_secs: int,
+    non_invasive: bool = False,
+    detach_on_exit: bool = True,
+    startup_command: str | None = None,
+) -> str:
+    """Attach to an existing PID via `windbg_open_user_process`."""
+    arguments: dict[str, Any] = {
+        "pid": pid,
+        "non_invasive": non_invasive,
+        "detach_on_exit": detach_on_exit,
+        "attach_timeout_secs": attach_timeout_secs,
+    }
+    if session_id:
+        arguments["session_id"] = session_id
+    if startup_command:
+        arguments["startup_command"] = startup_command
+
+    print("attaching to pid:", pid)
+    session = client.call_tool(
+        "windbg_open_user_process",
         arguments,
         timeout_secs=attach_timeout_secs + 20,
     )["session"]

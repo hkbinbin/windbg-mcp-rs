@@ -9,7 +9,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::executor::{
     CommandDispatcher, CommandExecutionResult, DebuggerExecutionState, ExecutionError,
-    ExecutionMode, OutputSnapshot, default_attach_timeout,
+    ExecutionMode, OutputSnapshot, UserModeAttach, default_attach_timeout,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -195,6 +195,97 @@ impl HeadlessSessionManager {
         self.describe_session(&session_id).await
     }
 
+    /// Open a session that debugs a user-mode process either by spawning the
+    /// debuggee (`UserModeAttach::Launch`) or by attaching to an already
+    /// running PID (`UserModeAttach::AttachPid`).
+    pub async fn open_user_process_session(
+        &self,
+        attach: UserModeAttach,
+        session_id: Option<&str>,
+        startup_command: Option<&str>,
+        attach_timeout_secs: Option<u64>,
+    ) -> Result<HeadlessSessionInfo, ExecutionError> {
+        let attach = normalize_user_mode_attach(attach)?;
+        let normalized = attach.connection_key();
+        let startup_command = startup_command
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let transport = match &attach {
+            UserModeAttach::Launch { .. } => "user-launch",
+            UserModeAttach::AttachPid { .. } => "user-attach",
+        };
+
+        let session_id = {
+            let mut registry = self
+                .inner
+                .lock()
+                .expect("headless session registry lock poisoned");
+
+            if let Some(existing_id) = registry.by_connection.get(&normalized).cloned() {
+                if let Some(requested) = session_id
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .filter(|requested| *requested != existing_id)
+                {
+                    return Err(ExecutionError::Session(format!(
+                        "user-mode target `{normalized}` is already open as session `{existing_id}` and cannot be re-opened as `{requested}`"
+                    )));
+                }
+                registry.default_session_id = Some(existing_id.clone());
+                if let Some(existing) = registry.sessions.get_mut(&existing_id) {
+                    existing.last_accessed_unix_ms = timestamp_now_ms();
+                }
+                existing_id
+            } else {
+                let session_id = match session_id.map(str::trim).filter(|value| !value.is_empty()) {
+                    Some(requested) => {
+                        if registry.sessions.contains_key(requested) {
+                            return Err(ExecutionError::Session(format!(
+                                "session `{requested}` already exists"
+                            )));
+                        }
+                        requested.to_string()
+                    }
+                    None => {
+                        let generated = format!("user-{:02}", registry.next_session_number);
+                        registry.next_session_number += 1;
+                        generated
+                    }
+                };
+
+                let attach_timeout = Duration::from_secs(
+                    attach_timeout_secs.unwrap_or(default_attach_timeout().as_secs()),
+                );
+                let dispatcher = CommandDispatcher::spawn(ExecutionMode::UserModeProcess {
+                    attach: attach.clone(),
+                    startup_command: startup_command.clone(),
+                    attach_timeout,
+                })?;
+                let now = timestamp_now_ms();
+                registry
+                    .by_connection
+                    .insert(normalized.clone(), session_id.clone());
+                registry.sessions.insert(
+                    session_id.clone(),
+                    ManagedSession {
+                        session_id: session_id.clone(),
+                        transport: transport.to_string(),
+                        connection_options: normalized,
+                        startup_command,
+                        created_at_unix_ms: now,
+                        last_accessed_unix_ms: now,
+                        dispatcher,
+                    },
+                );
+                registry.default_session_id = Some(session_id.clone());
+                session_id
+            }
+        };
+
+        self.describe_session(&session_id).await
+    }
+
     pub async fn close_session(
         &self,
         session_id: &str,
@@ -341,6 +432,33 @@ impl HeadlessSessionManager {
         match session_id {
             Some(session_id) => Ok(Some(self.describe_session(&session_id).await?)),
             None => Ok(None),
+        }
+    }
+
+    /// Resolve the transport tag (`kernel`, `user-launch`, `user-attach`, or
+    /// `mock`) for `session_id`, or for the default session if `None`.
+    /// Returns `None` if no session is registered.
+    pub fn session_transport(&self, session_id: Option<&str>) -> Option<String> {
+        let registry = self
+            .inner
+            .lock()
+            .expect("headless session registry lock poisoned");
+        let resolved_id = match session_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(requested) => requested.to_string(),
+            None => registry.default_session_id.clone()?,
+        };
+        registry
+            .sessions
+            .get(&resolved_id)
+            .map(|session| session.transport.clone())
+    }
+
+    /// Returns true when the addressed session is a user-mode session
+    /// (either spawned via `Launch` or attached via `AttachPid`).
+    pub fn is_user_mode_session(&self, session_id: Option<&str>) -> bool {
+        match self.session_transport(session_id) {
+            Some(transport) => transport == "user-launch" || transport == "user-attach",
+            None => false,
         }
     }
 
@@ -667,6 +785,44 @@ fn normalize_kernel_connect_options(raw: &str) -> Result<String, ExecutionError>
     Ok(trimmed.to_string())
 }
 
+fn normalize_user_mode_attach(attach: UserModeAttach) -> Result<UserModeAttach, ExecutionError> {
+    match attach {
+        UserModeAttach::Launch {
+            command_line,
+            only_this_process,
+            detach_on_exit,
+        } => {
+            let trimmed = command_line.trim().trim_matches('"').to_string();
+            if trimmed.is_empty() {
+                return Err(ExecutionError::Session(
+                    "user-mode launch command line cannot be empty".to_string(),
+                ));
+            }
+            Ok(UserModeAttach::Launch {
+                command_line: trimmed,
+                only_this_process,
+                detach_on_exit,
+            })
+        }
+        UserModeAttach::AttachPid {
+            pid,
+            non_invasive,
+            detach_on_exit,
+        } => {
+            if pid == 0 {
+                return Err(ExecutionError::Session(
+                    "user-mode attach PID must be greater than zero".to_string(),
+                ));
+            }
+            Ok(UserModeAttach::AttachPid {
+                pid,
+                non_invasive,
+                detach_on_exit,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,5 +902,62 @@ mod tests {
             normalize_kernel_connect_options("windbgx –k net:port=50000,key=abc,target=10.0.0.5")
                 .expect("normalization should work");
         assert_eq!(normalized, "net:port=50000,key=abc,target=10.0.0.5");
+    }
+
+    #[test]
+    fn user_mode_attach_normalization_trims_quotes_and_whitespace() {
+        let normalized = normalize_user_mode_attach(UserModeAttach::Launch {
+            command_line: "  \"C:\\path\\to\\app.exe arg\"  ".to_string(),
+            only_this_process: true,
+            detach_on_exit: true,
+        })
+        .expect("launch normalization should work");
+        match normalized {
+            UserModeAttach::Launch { command_line, .. } => {
+                assert_eq!(command_line, "C:\\path\\to\\app.exe arg");
+            }
+            other => panic!("expected Launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_mode_attach_normalization_rejects_empty_command_line() {
+        let error = normalize_user_mode_attach(UserModeAttach::Launch {
+            command_line: "  ".to_string(),
+            only_this_process: true,
+            detach_on_exit: true,
+        })
+        .expect_err("empty command line should fail");
+        assert!(matches!(error, ExecutionError::Session(_)));
+    }
+
+    #[test]
+    fn user_mode_attach_normalization_rejects_zero_pid() {
+        let error = normalize_user_mode_attach(UserModeAttach::AttachPid {
+            pid: 0,
+            non_invasive: false,
+            detach_on_exit: true,
+        })
+        .expect_err("pid 0 should fail");
+        assert!(matches!(error, ExecutionError::Session(_)));
+    }
+
+    #[test]
+    fn user_mode_attach_connection_keys_are_unique_per_target() {
+        let launch_key = UserModeAttach::Launch {
+            command_line: "C:\\app.exe".to_string(),
+            only_this_process: true,
+            detach_on_exit: true,
+        }
+        .connection_key();
+        let attach_key = UserModeAttach::AttachPid {
+            pid: 1234,
+            non_invasive: false,
+            detach_on_exit: true,
+        }
+        .connection_key();
+        assert!(launch_key.starts_with("user-launch:"));
+        assert!(attach_key.starts_with("user-attach:"));
+        assert_ne!(launch_key, attach_key);
     }
 }

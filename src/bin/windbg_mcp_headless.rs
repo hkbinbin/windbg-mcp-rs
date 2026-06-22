@@ -9,12 +9,12 @@ use rmcp::{
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use windbg_mcp_rs::{HeadlessSessionManager, WindbgMcpServer};
+use windbg_mcp_rs::{HeadlessSessionManager, UserModeAttach, WindbgMcpServer};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "windbg-mcp-headless",
-    about = "Headless WinDbg MCP server with session-managed kernel attachments"
+    about = "Headless WinDbg MCP server with session-managed kernel and user-mode attachments"
 )]
 struct Cli {
     #[arg(
@@ -28,6 +28,39 @@ struct Cli {
         help = "Open an initial kernel session using the same options you would pass to -k, for example net:port=50000,key=..."
     )]
     connect_kernel: Option<String>,
+
+    #[arg(
+        long,
+        help = "Open an initial user-mode session by spawning the given command line as a debuggee, for example C:\\path\\to\\app.exe"
+    )]
+    launch_user: Option<String>,
+
+    #[arg(
+        long,
+        help = "Open an initial user-mode session by attaching to a running PID"
+    )]
+    attach_user_pid: Option<u32>,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "When --attach-user-pid is set, perform a non-invasive attach"
+    )]
+    user_non_invasive: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "When attaching to a user-mode process, terminate it on session close instead of detaching"
+    )]
+    user_terminate_on_exit: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "When launching a user-mode debuggee, follow child processes (default debugs only the spawned process)"
+    )]
+    user_follow_children: bool,
 
     #[arg(long, help = "Optional session id for the initial connection")]
     session_id: Option<String>,
@@ -52,6 +85,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let sessions = HeadlessSessionManager::new();
 
+    let kernel_count = cli.connect_kernel.is_some() as usize;
+    let user_count = cli.launch_user.is_some() as usize + cli.attach_user_pid.is_some() as usize;
+    if kernel_count + user_count > 1 {
+        return Err("--connect-kernel, --launch-user and --attach-user-pid are mutually exclusive"
+            .into());
+    }
+
     if let Some(connection) = cli.connect_kernel.as_deref() {
         let session = sessions
             .open_kernel_session(
@@ -64,7 +104,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(
             session_id = %session.session_id,
             connection = %session.connection_options,
-            "initial headless WinDbg session opened"
+            "initial headless WinDbg kernel session opened"
+        );
+    } else if let Some(command_line) = cli.launch_user.as_deref() {
+        let attach = UserModeAttach::Launch {
+            command_line: command_line.to_string(),
+            only_this_process: !cli.user_follow_children,
+            detach_on_exit: !cli.user_terminate_on_exit,
+        };
+        let session = sessions
+            .open_user_process_session(
+                attach,
+                cli.session_id.as_deref(),
+                cli.startup_command.as_deref(),
+                cli.attach_timeout_secs,
+            )
+            .await?;
+        tracing::info!(
+            session_id = %session.session_id,
+            connection = %session.connection_options,
+            "initial headless WinDbg user-mode session opened by launching a debuggee"
+        );
+    } else if let Some(pid) = cli.attach_user_pid {
+        let attach = UserModeAttach::AttachPid {
+            pid,
+            non_invasive: cli.user_non_invasive,
+            detach_on_exit: !cli.user_terminate_on_exit,
+        };
+        let session = sessions
+            .open_user_process_session(
+                attach,
+                cli.session_id.as_deref(),
+                cli.startup_command.as_deref(),
+                cli.attach_timeout_secs,
+            )
+            .await?;
+        tracing::info!(
+            session_id = %session.session_id,
+            connection = %session.connection_options,
+            "initial headless WinDbg user-mode session opened by attaching to PID"
         );
     }
 
