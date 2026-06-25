@@ -6,3 +6,5 @@ __pycache__/
 session.json
 session.md
 AGENTS.md
+.workbuddy/
+.plans/

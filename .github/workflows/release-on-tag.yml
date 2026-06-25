@@ -1,5 +1,14 @@
 name: Release On Tag
 
+# Publishes a GitHub release whenever a version tag (vX.Y.Z) is pushed.
+#
+# The release ships exactly the two binaries needed to run the tool:
+#   - windbg_mcp_headless.exe : the thin MCP server
+#   - windbg_cli.exe          : the debugger CLI / daemon (drives sessions)
+#
+# Both executables must sit in the SAME directory: the MCP server locates
+# windbg_cli.exe next to itself when opening a session.
+
 on:
   push:
     tags:
@@ -19,6 +28,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
       - name: Verify tag matches Cargo version
         shell: pwsh
         run: |
@@ -32,8 +44,8 @@ jobs:
             throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $cargoVersion"
           }
 
-      - name: Build release DLL
-        run: cargo build --release
+      - name: Build release binaries
+        run: cargo build --release --bin windbg_mcp_headless --bin windbg_cli
 
       - name: Prepare release assets
         shell: pwsh
@@ -42,15 +54,50 @@ jobs:
           $archiveName = "windbg-mcp-rs-${{ github.ref_name }}-windows-x64.zip"
 
           New-Item -ItemType Directory -Path $assetDir -Force | Out-Null
-          Copy-Item "target/release/windbg_mcp_rs.dll" "$assetDir/windbg_mcp_rs.dll"
 
-          if (Test-Path "target/release/windbg_mcp_rs.pdb") {
-            Copy-Item "target/release/windbg_mcp_rs.pdb" "$assetDir/windbg_mcp_rs.pdb"
-          }
+          # The two binaries that make up a working install.
+          Copy-Item "target/release/windbg_mcp_headless.exe" "$assetDir/windbg_mcp_headless.exe"
+          Copy-Item "target/release/windbg_cli.exe"          "$assetDir/windbg_cli.exe"
+
+          # A short usage note so the zip is self-explanatory.
+          @"
+          windbg-mcp-rs ${{ github.ref_name }}
+
+          Contents:
+            windbg_mcp_headless.exe  Thin MCP server (open/close session + help).
+            windbg_cli.exe           Debugger CLI / daemon. Drives all debugging.
+
+          IMPORTANT: keep both .exe files in the SAME folder. The MCP server
+          starts windbg_cli.exe (located next to itself) to host debugger
+          sessions, so they must stay together.
+
+          MCP client config (stdio):
+            {
+              "mcpServers": {
+                "windbg_mcp_headless": {
+                  "command": "C:\\path\\to\\windbg_mcp_headless.exe",
+                  "args": []
+                }
+              }
+            }
+
+          Then: windbg_open_session -> windbg_cli do --name <name> <action> -> windbg_close_session
+          Run `windbg_cli --help` and `windbg_cli do --help` for the full action list.
+          "@ | Set-Content -Path "$assetDir/README.txt" -Encoding utf8
 
           Compress-Archive -Path "$assetDir/*" -DestinationPath $archiveName -Force
-          $hash = (Get-FileHash $archiveName -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -Path "$archiveName.sha256" -Value "$hash  $archiveName"
+
+          # SHA-256 for the archive and each loose binary.
+          $items = @(
+            $archiveName,
+            "$assetDir/windbg_mcp_headless.exe",
+            "$assetDir/windbg_cli.exe"
+          )
+          foreach ($item in $items) {
+            $hash = (Get-FileHash $item -Algorithm SHA256).Hash.ToLowerInvariant()
+            $name = Split-Path $item -Leaf
+            Set-Content -Path "$item.sha256" -Value "$hash  $name"
+          }
 
       - name: Publish GitHub release
         uses: ncipollo/release-action@v1
@@ -62,3 +109,7 @@ jobs:
           artifacts: |
             windbg-mcp-rs-${{ github.ref_name }}-windows-x64.zip
             windbg-mcp-rs-${{ github.ref_name }}-windows-x64.zip.sha256
+            dist/windbg_mcp_headless.exe
+            dist/windbg_mcp_headless.exe.sha256
+            dist/windbg_cli.exe
+            dist/windbg_cli.exe.sha256

@@ -24,12 +24,15 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use windbg_mcp_rs::{
     DebuggerExecutionState, HeadlessSessionInfo, HeadlessSessionManager, UserModeAttach,
+    daemon::{
+        DaemonRegistry, Request, Response, list_registries, read_registry, remove_registry,
+        write_registry,
+    },
 };
 
 const DEFAULT_READY_TIMEOUT_SECS: u64 = 60;
@@ -334,128 +337,9 @@ enum DoAction {
 }
 
 // ---------------------------------------------------------------------------
-// Daemon registry helpers (one JSON file per daemon under %TEMP%).
+// Daemon registry + wire protocol live in `windbg_mcp_rs::daemon` so the thin
+// MCP server can launch and drive the same daemons. See imports above.
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DaemonRegistry {
-    name: String,
-    pid: u32,
-    address: String,
-    target_summary: String,
-    started_at_unix_ms: u64,
-}
-
-fn registry_dir() -> PathBuf {
-    let base = std::env::var_os("TEMP")
-        .or_else(|| std::env::var_os("TMP"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("windbg_cli_daemons")
-}
-
-fn registry_path(name: &str) -> PathBuf {
-    registry_dir().join(format!("{name}.json"))
-}
-
-fn write_registry(entry: &DaemonRegistry) -> std::io::Result<()> {
-    let dir = registry_dir();
-    fs::create_dir_all(&dir)?;
-    let path = registry_path(&entry.name);
-    let bytes = serde_json::to_vec_pretty(entry).expect("serialize registry");
-    fs::write(path, bytes)
-}
-
-fn read_registry(name: &str) -> std::io::Result<DaemonRegistry> {
-    let bytes = fs::read(registry_path(name))?;
-    let entry: DaemonRegistry = serde_json::from_slice(&bytes)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    Ok(entry)
-}
-
-fn remove_registry(name: &str) {
-    let _ = fs::remove_file(registry_path(name));
-}
-
-fn list_registries() -> Vec<DaemonRegistry> {
-    let dir = registry_dir();
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        if let Ok(bytes) = fs::read(&path) {
-            if let Ok(reg) = serde_json::from_slice::<DaemonRegistry>(&bytes) {
-                out.push(reg);
-            }
-        }
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Wire protocol.
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "op")]
-enum Request {
-    State,
-    Info,
-    Exec { command: String },
-    Step { count: u32 },
-    StepOver { count: u32 },
-    StepOut,
-    StepUntil { address: String, into: bool },
-    Go,
-    Interrupt,
-    WaitBreak { timeout_secs: u64 },
-    Bp { location: String, one_shot: bool },
-    Ba { address: String, access: String, size: u32 },
-    Bc { id: String },
-    Bl,
-    Reg { registers: Vec<String> },
-    Mem { address: String, format: String, count: u32 },
-    Dis { address: String, count: u32 },
-    Bt { format: String, count: u32 },
-    Snapshot,
-    Dump {
-        out_dir: String,
-        minidump: bool,
-        modules: bool,
-        module_filter: Option<String>,
-        resume_after: bool,
-    },
-    Shutdown,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Response {
-    ok: bool,
-    text: String,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    state: Option<Value>,
-}
-
-impl Response {
-    fn ok(text: impl Into<String>) -> Self {
-        Self { ok: true, text: text.into(), state: None }
-    }
-    fn ok_with_state(text: impl Into<String>, state: DebuggerExecutionState) -> Self {
-        Self {
-            ok: true,
-            text: text.into(),
-            state: serde_json::to_value(state).ok(),
-        }
-    }
-    fn err(text: impl Into<String>) -> Self {
-        Self { ok: false, text: text.into(), state: None }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Entry point.
@@ -1534,23 +1418,7 @@ fn build_request(action: &DoAction) -> Result<Request, String> {
 }
 
 fn send_request(address: &str, request: &Request) -> Result<Response, String> {
-    let mut stream = TcpStream::connect_timeout(
-        &address.parse().map_err(|e: std::net::AddrParseError| e.to_string())?,
-        Duration::from_secs(5),
-    )
-    .map_err(|e| format!("connect {address}: {e}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(180)))
-        .map_err(|e| e.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(15)))
-        .map_err(|e| e.to_string())?;
-    let payload = serde_json::to_string(request).map_err(|e| e.to_string())?;
-    writeln!(stream, "{payload}").map_err(|e| format!("write: {e}"))?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| format!("read: {e}"))?;
-    serde_json::from_str(line.trim()).map_err(|e| format!("decode: {e}"))
+    windbg_mcp_rs::daemon::send_request(address, request)
 }
 
 // ---------------------------------------------------------------------------

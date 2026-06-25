@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 use rmcp::{
     ServiceExt,
@@ -9,12 +11,12 @@ use rmcp::{
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use windbg_mcp_rs::{HeadlessSessionManager, UserModeAttach, WindbgMcpServer};
+use windbg_mcp_rs::WindbgMcpServer;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "windbg-mcp-headless",
-    about = "Headless WinDbg MCP server with session-managed kernel and user-mode attachments"
+    about = "Thin WinDbg MCP server: open/close debugger daemons and point at the windbg_cli CLI"
 )]
 struct Cli {
     #[arg(
@@ -25,57 +27,9 @@ struct Cli {
 
     #[arg(
         long,
-        help = "Open an initial kernel session using the same options you would pass to -k, for example net:port=50000,key=..."
+        help = "Path to the windbg_cli executable used to host debugger daemons. Defaults to WINDBG_CLI_PATH, then the server's own directory, then PATH."
     )]
-    connect_kernel: Option<String>,
-
-    #[arg(
-        long,
-        help = "Open an initial user-mode session by spawning the given command line as a debuggee, for example C:\\path\\to\\app.exe"
-    )]
-    launch_user: Option<String>,
-
-    #[arg(
-        long,
-        help = "Open an initial user-mode session by attaching to a running PID"
-    )]
-    attach_user_pid: Option<u32>,
-
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "When --attach-user-pid is set, perform a non-invasive attach"
-    )]
-    user_non_invasive: bool,
-
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "When attaching to a user-mode process, terminate it on session close instead of detaching"
-    )]
-    user_terminate_on_exit: bool,
-
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "When launching a user-mode debuggee, follow child processes (default debugs only the spawned process)"
-    )]
-    user_follow_children: bool,
-
-    #[arg(long, help = "Optional session id for the initial connection")]
-    session_id: Option<String>,
-
-    #[arg(
-        long,
-        help = "Optional debugger command to run right after the initial attach, such as .symfix; .reload"
-    )]
-    startup_command: Option<String>,
-
-    #[arg(
-        long,
-        help = "Timeout in seconds to wait for the initial attach to complete"
-    )]
-    attach_timeout_secs: Option<u64>,
+    cli_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -83,100 +37,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
     let cli = Cli::parse();
-    let sessions = HeadlessSessionManager::new();
+    let server = WindbgMcpServer::new(cli.cli_path.clone());
 
-    let kernel_count = cli.connect_kernel.is_some() as usize;
-    let user_count = cli.launch_user.is_some() as usize + cli.attach_user_pid.is_some() as usize;
-    if kernel_count + user_count > 1 {
-        return Err("--connect-kernel, --launch-user and --attach-user-pid are mutually exclusive"
-            .into());
-    }
-
-    if let Some(connection) = cli.connect_kernel.as_deref() {
-        let session = sessions
-            .open_kernel_session(
-                connection,
-                cli.session_id.as_deref(),
-                cli.startup_command.as_deref(),
-                cli.attach_timeout_secs,
-            )
-            .await?;
-        tracing::info!(
-            session_id = %session.session_id,
-            connection = %session.connection_options,
-            "initial headless WinDbg kernel session opened"
-        );
-    } else if let Some(command_line) = cli.launch_user.as_deref() {
-        let attach = UserModeAttach::Launch {
-            command_line: command_line.to_string(),
-            only_this_process: !cli.user_follow_children,
-            detach_on_exit: !cli.user_terminate_on_exit,
-        };
-        let session = sessions
-            .open_user_process_session(
-                attach,
-                cli.session_id.as_deref(),
-                cli.startup_command.as_deref(),
-                cli.attach_timeout_secs,
-            )
-            .await?;
-        tracing::info!(
-            session_id = %session.session_id,
-            connection = %session.connection_options,
-            "initial headless WinDbg user-mode session opened by launching a debuggee"
-        );
-    } else if let Some(pid) = cli.attach_user_pid {
-        let attach = UserModeAttach::AttachPid {
-            pid,
-            non_invasive: cli.user_non_invasive,
-            detach_on_exit: !cli.user_terminate_on_exit,
-        };
-        let session = sessions
-            .open_user_process_session(
-                attach,
-                cli.session_id.as_deref(),
-                cli.startup_command.as_deref(),
-                cli.attach_timeout_secs,
-            )
-            .await?;
-        tracing::info!(
-            session_id = %session.session_id,
-            connection = %session.connection_options,
-            "initial headless WinDbg user-mode session opened by attaching to PID"
-        );
-    }
-
-    let cleanup_sessions = sessions.clone();
-    let server = WindbgMcpServer::headless(sessions);
-    let result = if let Some(listen) = cli.listen.as_deref() {
-        run_http(server, listen).await
+    if let Some(listen) = cli.listen.as_deref() {
+        run_http(server, listen).await?;
     } else {
         let service = server.serve(stdio()).await?;
         service
             .waiting()
             .await
             .map(|_| ())
-            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
-    };
-
-    for close_result in cleanup_sessions
-        .close_all_sessions(Some(12), Some(true))
-        .await
-    {
-        match close_result {
-            Ok(result) => tracing::info!(
-                session_id = %result.closed_session_id,
-                resume_attempted = result.resume_attempted,
-                shutdown_completed = result.shutdown_completed,
-                "cleaned up headless session during server shutdown"
-            ),
-            Err(error) => {
-                tracing::warn!(error = %error, "failed to clean up headless session during server shutdown")
-            }
-        }
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
     }
-
-    result?;
 
     Ok(())
 }
@@ -197,7 +69,7 @@ async fn run_http(server: WindbgMcpServer, listen: &str) -> Result<(), Box<dyn s
         },
     );
 
-    tracing::info!("headless WinDbg MCP listening at http://{}/mcp", local_addr);
+    tracing::info!("thin WinDbg MCP listening at http://{}/mcp", local_addr);
     let router = axum::Router::new().nest_service("/mcp", service);
     axum::serve(listener, router)
         .with_graceful_shutdown(async move { cancellation.cancelled_owned().await })

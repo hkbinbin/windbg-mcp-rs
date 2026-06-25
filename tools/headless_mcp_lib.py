@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""Shared helpers for driving the headless WinDbg MCP server over stdio."""
+"""Shared helpers for driving the thin WinDbg MCP server over stdio.
+
+The MCP server now exposes only three tools:
+
+  - windbg_open_session  (mode=launch|attach|kernel) -> returns daemon `name`
+  - windbg_close_session (name, force?)
+  - windbg_use_help      (topic?)
+
+All detailed debugging is performed by running the `windbg_cli` executable
+directly. The `CliDriver` helper wraps `windbg_cli do --name <name> ...`.
+"""
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import subprocess
@@ -19,13 +30,22 @@ def redact(value: str) -> str:
     return KEY_RE.sub(r"\1<redacted>", value)
 
 
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
 def default_exe() -> Path:
-    return (
-        Path(__file__).resolve().parents[1]
-        / "target"
-        / "release"
-        / "windbg_mcp_headless.exe"
-    )
+    return repo_root() / "target" / "release" / "windbg_mcp_headless.exe"
+
+
+def default_cli() -> Path:
+    return repo_root() / "target" / "release" / "windbg_cli.exe"
+
+
+def registry_dir_path() -> Path:
+    """Mirror of the Rust `daemon::registry_dir()` resolution."""
+    base = os.environ.get("TEMP") or os.environ.get("TMP") or "."
+    return Path(base) / "windbg_cli_daemons"
 
 
 def tcp_probe(host: str, port: int, timeout_secs: float = 3.0) -> bool:
@@ -34,14 +54,6 @@ def tcp_probe(host: str, port: int, timeout_secs: float = 3.0) -> bool:
             return True
     except OSError:
         return False
-
-
-def print_command_result(command: str, result: dict[str, Any], max_chars: int | None = None) -> None:
-    print(f"command: {command}")
-    output = str(result.get("output", "")).rstrip()
-    if max_chars is not None and len(output) > max_chars:
-        output = output[:max_chars] + "\n... <truncated>"
-    print(output)
 
 
 class McpStdioClient:
@@ -123,7 +135,7 @@ class McpStdioClient:
         tools_id = self.send("tools/list", {})
         tools = self.response(tools_id, 10)["result"]["tools"]
         tool_names = {tool["name"] for tool in tools}
-        print("tools:", len(tool_names), "recover=", "windbg_recover_session" in tool_names)
+        print("tools:", len(tool_names), sorted(tool_names))
         return tool_names
 
     def call_tool(
@@ -150,175 +162,142 @@ class McpStdioClient:
         self.proc.stdin.flush()
 
 
-def state_name(state: dict[str, Any]) -> str:
-    return str(state.get("status_name") or "unknown")
-
-
-def query_state(client: McpStdioClient, session_id: str) -> dict[str, Any]:
-    payload = client.call_tool(
-        "windbg_get_execution_state",
-        {"session_id": session_id},
-        timeout_secs=20,
-    )
-    return payload.get("state", {})
-
-
-def wait_for_attached_state(
-    client: McpStdioClient,
-    session_id: str,
-    timeout_secs: int,
-) -> dict[str, Any]:
-    deadline = time.time() + timeout_secs
-    last_state: dict[str, Any] = {}
-    while time.time() < deadline:
-        last_state = query_state(client, session_id)
-        if state_name(last_state) != "no_debuggee":
-            return last_state
-        time.sleep(1)
-
-    return last_state
-
-
-def ensure_command_ready(
-    client: McpStdioClient,
-    session_id: str,
-    timeout_secs: int,
-) -> dict[str, Any]:
-    state = wait_for_attached_state(client, session_id, timeout_secs)
-    if state.get("ready_for_commands"):
-        return state
-
-    if state.get("running"):
-        print("interrupting:", state_name(state))
-        payload = client.call_tool(
-            "windbg_interrupt_target",
-            {"session_id": session_id},
-            timeout_secs=timeout_secs,
-        )
-        state = payload.get("state", {})
-
-    deadline = time.time() + timeout_secs
-    while not state.get("ready_for_commands") and time.time() < deadline:
-        time.sleep(1)
-        state = query_state(client, session_id)
-
-    if not state.get("ready_for_commands"):
-        raise RuntimeError(
-            "session is not ready for commands "
-            f"(status={state_name(state)}, raw={state.get('raw_status')})"
-        )
-
-    return state
+# ---------------------------------------------------------------------------
+# Thin MCP session management (open/close return/accept a daemon `name`).
+# ---------------------------------------------------------------------------
 
 
 def open_kernel_session(
     client: McpStdioClient,
     connection: str,
-    session_id: str,
+    name: str | None,
     attach_timeout_secs: int,
     startup_command: str | None = None,
-) -> str:
+) -> dict[str, Any]:
     arguments: dict[str, Any] = {
+        "mode": "kernel",
         "connection": connection,
-        "session_id": session_id,
         "attach_timeout_secs": attach_timeout_secs,
     }
+    if name:
+        arguments["name"] = name
     if startup_command:
         arguments["startup_command"] = startup_command
 
-    print("opening:", redact(connection))
-    session = client.call_tool(
+    print("opening kernel:", redact(connection))
+    info = client.call_tool(
         "windbg_open_session",
         arguments,
-        timeout_secs=attach_timeout_secs + 20,
-    )["session"]
-    opened_session_id = session["session_id"]
-    state = session.get("state") or {}
-    print("opened:", opened_session_id, state_name(state))
-    return opened_session_id
+        timeout_secs=attach_timeout_secs + 30,
+    )
+    print("opened:", json.dumps(info, ensure_ascii=False))
+    return info
 
 
 def open_user_launch_session(
     client: McpStdioClient,
     command_line: str,
-    session_id: str | None,
+    name: str | None,
     attach_timeout_secs: int,
-    only_this_process: bool = True,
-    detach_on_exit: bool = True,
+    follow_children: bool = False,
     startup_command: str | None = None,
-) -> str:
-    """Spawn `command_line` under dbgeng control via `windbg_open_user_process`."""
+) -> dict[str, Any]:
     arguments: dict[str, Any] = {
+        "mode": "launch",
         "command_line": command_line,
-        "only_this_process": only_this_process,
-        "detach_on_exit": detach_on_exit,
+        "follow_children": follow_children,
         "attach_timeout_secs": attach_timeout_secs,
     }
-    if session_id:
-        arguments["session_id"] = session_id
+    if name:
+        arguments["name"] = name
     if startup_command:
         arguments["startup_command"] = startup_command
 
     print("launching user-mode debuggee:", command_line)
-    session = client.call_tool(
-        "windbg_open_user_process",
+    info = client.call_tool(
+        "windbg_open_session",
         arguments,
-        timeout_secs=attach_timeout_secs + 20,
-    )["session"]
-    opened_session_id = session["session_id"]
-    state = session.get("state") or {}
-    print("opened:", opened_session_id, state_name(state))
-    return opened_session_id
+        timeout_secs=attach_timeout_secs + 30,
+    )
+    print("opened:", json.dumps(info, ensure_ascii=False))
+    return info
 
 
 def open_user_attach_session(
     client: McpStdioClient,
     pid: int,
-    session_id: str | None,
+    name: str | None,
     attach_timeout_secs: int,
     non_invasive: bool = False,
-    detach_on_exit: bool = True,
     startup_command: str | None = None,
-) -> str:
-    """Attach to an existing PID via `windbg_open_user_process`."""
+) -> dict[str, Any]:
     arguments: dict[str, Any] = {
+        "mode": "attach",
         "pid": pid,
         "non_invasive": non_invasive,
-        "detach_on_exit": detach_on_exit,
         "attach_timeout_secs": attach_timeout_secs,
     }
-    if session_id:
-        arguments["session_id"] = session_id
+    if name:
+        arguments["name"] = name
     if startup_command:
         arguments["startup_command"] = startup_command
 
     print("attaching to pid:", pid)
-    session = client.call_tool(
-        "windbg_open_user_process",
+    info = client.call_tool(
+        "windbg_open_session",
         arguments,
-        timeout_secs=attach_timeout_secs + 20,
-    )["session"]
-    opened_session_id = session["session_id"]
-    state = session.get("state") or {}
-    print("opened:", opened_session_id, state_name(state))
-    return opened_session_id
+        timeout_secs=attach_timeout_secs + 30,
+    )
+    print("opened:", json.dumps(info, ensure_ascii=False))
+    return info
 
 
-def close_kernel_session(
+def close_session(
     client: McpStdioClient,
-    session_id: str,
-    shutdown_timeout_secs: int,
-    resume_before_close: bool = True,
+    name: str,
+    force: bool = False,
     label: str = "closed",
 ) -> dict[str, Any]:
     payload = client.call_tool(
         "windbg_close_session",
-        {
-            "session_id": session_id,
-            "shutdown_timeout_secs": shutdown_timeout_secs,
-            "resume_before_close": resume_before_close,
-        },
-        timeout_secs=shutdown_timeout_secs + 20,
+        {"name": name, "force": force},
+        timeout_secs=30,
     )
     print(f"{label}:", json.dumps(payload, ensure_ascii=False))
     return payload
+
+
+# ---------------------------------------------------------------------------
+# CLI driver: run `windbg_cli do --name <name> <action>` for debugging.
+# ---------------------------------------------------------------------------
+
+
+class CliDriver:
+    """Drive a daemon-backed session via the `windbg_cli do` observer CLI."""
+
+    def __init__(self, name: str, cli: Path | None = None) -> None:
+        self.name = name
+        self.cli = cli or default_cli()
+
+    def do(self, *action: str, timeout_secs: float = 120.0) -> subprocess.CompletedProcess:
+        cmd = [str(self.cli), "do", "--name", self.name, *action]
+        print("cli:", " ".join(cmd))
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_secs,
+        )
+        if proc.stdout.strip():
+            print(proc.stdout.rstrip())
+        if proc.returncode != 0 and proc.stderr.strip():
+            print("stderr:", proc.stderr.rstrip())
+        return proc
+
+    def exec(self, command: str, timeout_secs: float = 120.0) -> subprocess.CompletedProcess:
+        return self.do("exec", command, timeout_secs=timeout_secs)
+
+    def state(self) -> subprocess.CompletedProcess:
+        return self.do("state")

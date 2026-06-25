@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Validate process-scoped user-VA breakpoints over a live KDNET MCP session.
+"""Validate process-scoped user-VA breakpoints over a thin-MCP daemon session.
 
-Use this when you need to confirm that `/p <EPROCESS> <user_va>` style
-breakpoints work for a user-mode process while attached through kernel debug.
-The default path uses hardware execute breakpoints (`ba e 1`) because live
-KDNET testing showed software `bp /p <EPROCESS> <user_va>` can create a
-breakpoint ID without hitting reliably.
-The script intentionally keeps KDNET secrets and guest credentials out of the
-repository; pass connection strings and trigger commands at runtime.
+Opens a kernel daemon via the MCP `windbg_open_session` tool, then sets a
+process-scoped user-VA breakpoint through the `windbg_cli do` CLI. The default
+path uses a hardware execute breakpoint (`ba e 1`) because live KDNET testing
+showed software `bp /p <EPROCESS> <user_va>` can create a breakpoint ID without
+hitting reliably.
+
+You must supply --eprocess; resolve it via
+`windbg_cli do exec "!process 0 0 <image>"`.
 """
 
 from __future__ import annotations
@@ -18,175 +19,94 @@ import sys
 from pathlib import Path
 
 from headless_mcp_lib import (
+    CliDriver,
     McpStdioClient,
-    close_kernel_session,
+    close_session,
+    default_cli,
     default_exe,
-    ensure_command_ready,
     open_kernel_session,
-    query_state,
-    state_name,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", type=Path, default=default_exe())
+    parser.add_argument("--cli", type=Path, default=default_cli())
     parser.add_argument("--connection", required=True, help="KDNET -k connection string")
-    parser.add_argument("--session-id", default="user-va-breakpoint-smoke")
+    parser.add_argument("--name", default="user-va-breakpoint-smoke")
     parser.add_argument("--attach-timeout-secs", type=int, default=60)
-    parser.add_argument("--ready-timeout-secs", type=int, default=60)
-    parser.add_argument("--shutdown-timeout-secs", type=int, default=12)
     parser.add_argument("--hit-timeout-secs", type=int, default=30)
     parser.add_argument("--location", required=True, help="User VA or symbol, e.g. 00007ff6`12345678")
-    parser.add_argument("--process-name", help="Target process image, e.g. challenge.exe")
-    parser.add_argument("--pid", help="Target PID, decimal by default or 0x-prefixed hex")
-    parser.add_argument("--eprocess", help="Known EPROCESS address. Skips !process resolution")
     parser.add_argument(
-        "--persistent",
-        action="store_false",
-        dest="one_shot",
-        default=True,
-        help="Use a persistent breakpoint instead of the default one-shot breakpoint.",
+        "--eprocess",
+        required=True,
+        help="Target EPROCESS address for /p scoping (resolve via !process 0 0 <image>)",
     )
     parser.add_argument(
         "--software",
         action="store_true",
-        help="Experiment with software `bp /p` instead of the default hardware execute breakpoint.",
+        help="Use software `bp /p` instead of the default hardware execute breakpoint.",
     )
     parser.add_argument(
         "--trigger-command",
-        help="Optional host-side command to start before waiting, such as ssh launching the guest app.",
+        help="Optional host-side command to start before waiting.",
     )
     return parser.parse_args()
 
 
-def require_process_selector(args: argparse.Namespace) -> None:
-    if not (args.process_name or args.pid or args.eprocess):
-        raise SystemExit("provide --process-name, --pid, or --eprocess")
-
-
 def main() -> int:
     args = parse_args()
-    require_process_selector(args)
-
     client = McpStdioClient(args.exe)
-    opened_session_id: str | None = None
+    opened_name: str | None = None
     closed = False
     trigger: subprocess.Popen[str] | None = None
     try:
-        client.initialize("headless-user-va-breakpoint-smoke")
-        opened_session_id = open_kernel_session(
+        client.initialize("thin-user-va-breakpoint-smoke")
+        info = open_kernel_session(
             client,
             args.connection,
-            args.session_id,
+            args.name,
             args.attach_timeout_secs,
+            startup_command=".symfix; .reload",
         )
+        opened_name = info["name"]
+        driver = CliDriver(opened_name, cli=args.cli)
 
-        state = ensure_command_ready(client, opened_session_id, args.ready_timeout_secs)
-        print("ready:", state_name(state))
-
+        driver.do("interrupt")
+        # Switch into the target process context, then set the breakpoint.
+        driver.exec(f".process /i /p {args.eprocess}")
         if args.software:
-            payload = client.call_tool(
-                "windbg_set_process_breakpoint",
-                {
-                    "session_id": opened_session_id,
-                    "location": args.location,
-                    "process_name": args.process_name,
-                    "pid": args.pid,
-                    "eprocess": args.eprocess,
-                    "kind": "bp",
-                    "one_shot": args.one_shot,
-                    "set_context": True,
-                    "allow_user_software": True,
-                },
-                timeout_secs=180,
-            )
-            created = payload.get("created_breakpoints")
+            driver.exec(f"bp /p {args.eprocess} {args.location}")
         else:
-            payload = client.call_tool(
-                "windbg_set_hardware_breakpoint",
-                {
-                    "session_id": opened_session_id,
-                    "address": args.location,
-                    "process_name": args.process_name,
-                    "pid": args.pid,
-                    "eprocess": args.eprocess,
-                    "access": "execute",
-                    "size": 1,
-                    "set_context": True,
-                },
-                timeout_secs=180,
-            )
-            created = payload.get("created_breakpoints")
-        process = payload.get("process", {})
-        print(
-            "set_user_va_breakpoint:",
-            "mode=",
-            "software" if args.software else "hardware",
-            "eprocess=",
-            process.get("eprocess"),
-            "image=",
-            process.get("image"),
-            "location=",
-            args.location,
-            "created=",
-            created,
-        )
+            driver.do("ba", args.location, "--access", "e", "--size", "1")
+        driver.do("bl")
 
         if args.trigger_command:
             trigger = subprocess.Popen(args.trigger_command, shell=True, text=True)
             print("trigger_started:", args.trigger_command)
 
-        hit = client.call_tool(
-            "windbg_continue_until_break",
-            {"session_id": opened_session_id, "timeout_secs": args.hit_timeout_secs},
-            timeout_secs=args.hit_timeout_secs + 60,
-        )
-        print("hit_timed_out:", hit.get("timed_out"))
-        if hit.get("timed_out"):
+        driver.do("go")
+        wb = driver.do("wait-break", "--timeout-secs", str(args.hit_timeout_secs))
+        if wb.returncode != 0:
             raise RuntimeError("user-VA breakpoint did not hit before timeout")
+        driver.do("snapshot")
 
-        snapshot = client.call_tool(
-            "windbg_breakpoint_snapshot",
-            {"session_id": opened_session_id, "stack_count": 24, "disassemble_count": 16},
-            timeout_secs=120,
-        )
-        print("snapshot_steps:", len(snapshot.get("steps", [])))
-
-        client.call_tool(
-            "windbg_clear_breakpoint",
-            {"session_id": opened_session_id},
-            timeout_secs=30,
-        )
-        close_kernel_session(client, opened_session_id, args.shutdown_timeout_secs)
+        driver.do("bc", "*")
+        close_session(client, opened_name)
         closed = True
         return 0
     finally:
         if trigger and trigger.poll() is None:
             trigger.terminate()
-        if opened_session_id and not closed:
+        if opened_name and not closed:
             try:
-                state = query_state(client, opened_session_id)
-                if not state.get("ready_for_commands"):
-                    client.call_tool(
-                        "windbg_interrupt_target",
-                        {"session_id": opened_session_id},
-                        timeout_secs=30,
-                    )
-                client.call_tool(
-                    "windbg_clear_breakpoint",
-                    {"session_id": opened_session_id},
-                    timeout_secs=30,
-                )
+                d = CliDriver(opened_name, cli=args.cli)
+                d.do("interrupt")
+                d.do("bc", "*")
             except Exception as exc:
                 print(f"user_va_breakpoint_cleanup_failed: {exc}", file=sys.stderr)
             try:
-                close_kernel_session(
-                    client,
-                    opened_session_id,
-                    args.shutdown_timeout_secs,
-                    label="closed_after_error",
-                )
+                close_session(client, opened_name, force=True, label="closed_after_error")
             except Exception as exc:
                 print(f"close_after_error_failed: {exc}", file=sys.stderr)
         client.close()

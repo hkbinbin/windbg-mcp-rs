@@ -467,6 +467,9 @@ impl HeadlessSessionManager {
         session_id: Option<&str>,
         command: String,
     ) -> Result<CommandExecutionResult, ExecutionError> {
+        if let Some(message) = blocked_unsafe_debugger_command(&command) {
+            return Err(ExecutionError::Blocked(message));
+        }
         let (session_id, dispatcher) = self.resolve_dispatcher(session_id)?;
         let result = dispatcher.execute(command).await?;
         self.touch_session(&session_id);
@@ -823,6 +826,62 @@ fn normalize_user_mode_attach(attach: UserModeAttach) -> Result<UserModeAttach, 
     }
 }
 
+/// Reject WinDbg commands that have crashed or destabilized dbgeng in this
+/// headless path. Shared by every `execute_command` caller (MCP and CLI).
+///
+/// Returns `Some(message)` when the command must be blocked.
+fn blocked_unsafe_debugger_command(command: &str) -> Option<String> {
+    for segment in command.split([';', '\n', '\r']) {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        if disables_load_event_filter(segment) {
+            return Some(format!(
+                "blocked unsafe WinDbg command `{segment}`: this dbgeng headless path has been observed to access-violate when disabling `ld` filters after a module-load event. Leave the load filter in the short-lived session, clear normal breakpoints with `bc`, then resume or close the session."
+            ));
+        }
+        if looks_like_fragile_multi_register_read(segment) {
+            return Some(format!(
+                "blocked fragile WinDbg command `{segment}`: raw `r <reg> <reg> ...` subset reads have produced transient dbgeng `0x80040205` states in headless mode. Use `do reg <reg> <reg>` instead; it reads each register as an isolated command."
+            ));
+        }
+    }
+    None
+}
+
+fn looks_like_fragile_multi_register_read(segment: &str) -> bool {
+    let mut parts = segment.split_whitespace();
+    let Some(verb) = parts.next() else {
+        return false;
+    };
+    if !verb.eq_ignore_ascii_case("r") {
+        return false;
+    }
+
+    let registers = parts.collect::<Vec<_>>();
+    registers.len() > 1 && registers.iter().all(|part| !part.contains('='))
+}
+
+fn disables_load_event_filter(segment: &str) -> bool {
+    let mut parts = segment.split_whitespace();
+    let Some(verb) = parts.next() else {
+        return false;
+    };
+    if !verb.eq_ignore_ascii_case("sxd") {
+        return false;
+    }
+    let Some(filter_spec) = parts.next() else {
+        return false;
+    };
+    let filter_name = filter_spec
+        .split_once(':')
+        .map(|(name, _)| name)
+        .unwrap_or(filter_spec)
+        .to_ascii_lowercase();
+    matches!(filter_name.as_str(), "ld" | "ld*")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,6 +902,35 @@ mod tests {
             .await
             .expect("command should execute");
         assert_eq!(result.output, "register dump");
+    }
+
+    #[test]
+    fn blocklist_rejects_sxd_load_filter_and_multi_register_reads() {
+        assert!(blocked_unsafe_debugger_command("sxd ld").is_some());
+        assert!(blocked_unsafe_debugger_command("sxd ld:foo.sys").is_some());
+        assert!(blocked_unsafe_debugger_command("sxd ld*").is_some());
+        assert!(blocked_unsafe_debugger_command("r rip rax rcx").is_some());
+        // Safe commands must pass through.
+        assert!(blocked_unsafe_debugger_command("r").is_none());
+        assert!(blocked_unsafe_debugger_command("r @rip").is_none());
+        assert!(blocked_unsafe_debugger_command("r rax=5").is_none());
+        assert!(blocked_unsafe_debugger_command("sxe ld:foo.sys").is_none());
+        assert!(blocked_unsafe_debugger_command("bp nt!NtClose").is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_command_blocks_unsafe_input_before_dispatch() {
+        let manager = HeadlessSessionManager::new();
+        manager
+            .open_mock_session("session-01", HashMap::new())
+            .await
+            .expect("mock session should open");
+
+        let err = manager
+            .execute_command(None, "sxd ld".to_string())
+            .await
+            .expect_err("unsafe command should be blocked");
+        assert!(matches!(err, ExecutionError::Blocked(_)));
     }
 
     #[tokio::test]

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Run a reproducible ShadowGate-oriented headless KDNET validation."""
+"""Run a reproducible ShadowGate-oriented thin-MCP KDNET validation.
+
+Opens a kernel daemon via the MCP `windbg_open_session` tool, then drives all
+debugger inspection through the `windbg_cli do` CLI (exec/go/interrupt/
+wait-break), coordinating optional guest-side service actions over SSH.
+"""
 
 from __future__ import annotations
 
@@ -8,17 +13,14 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
 
 from headless_mcp_lib import (
+    CliDriver,
     McpStdioClient,
-    close_kernel_session,
+    close_session,
+    default_cli,
     default_exe,
-    ensure_command_ready,
     open_kernel_session,
-    print_command_result,
-    query_state,
-    state_name,
 )
 
 
@@ -49,11 +51,11 @@ LOAD_BREAK_COMMANDS = [
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", type=Path, default=default_exe())
+    parser.add_argument("--cli", type=Path, default=default_cli())
     parser.add_argument("--connection", required=True, help="KDNET -k connection string")
-    parser.add_argument("--session-id", default="shadowgate-smoke")
+    parser.add_argument("--name", default="shadowgate-smoke")
     parser.add_argument("--attach-timeout-secs", type=int, default=60)
-    parser.add_argument("--ready-timeout-secs", type=int, default=60)
-    parser.add_argument("--shutdown-timeout-secs", type=int, default=12)
+    parser.add_argument("--hit-timeout-secs", type=int, default=60)
     parser.add_argument("--guest", help="SSH target, for example administrator@<guest-ip>")
     parser.add_argument("--ssh", default="ssh", help="SSH executable")
     parser.add_argument("--ssh-timeout-secs", type=int, default=45)
@@ -62,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-command", help="Optional guest-side probe command to run")
     parser.add_argument("--skip-guest-actions", action="store_true")
     parser.add_argument("--driver-load-break", action="store_true")
-    parser.add_argument("--skip-prepare-symbols", action="store_true")
+    parser.add_argument("--skip-symfix", action="store_true")
     parser.add_argument("--stop-service-after", action="store_true")
     parser.add_argument(
         "--command",
@@ -98,61 +100,25 @@ def run_guest_async(args: argparse.Namespace, command: str) -> None:
     run_guest(args, wrapped)
 
 
-def wait_for_break(
-    client: McpStdioClient,
-    session_id: str,
-    timeout_secs: int,
-) -> dict[str, Any]:
-    deadline = time.time() + timeout_secs
-    state: dict[str, Any] = {}
-    while time.time() < deadline:
-        state = query_state(client, session_id)
-        if state.get("ready_for_commands"):
-            return state
-        time.sleep(1)
-    raise RuntimeError(f"target did not break before timeout; last state={state_name(state)}")
-
-
-def execute(client: McpStdioClient, session_id: str, command: str) -> None:
-    result = client.call_tool(
-        "windbg_execute_command",
-        {"session_id": session_id, "command": command},
-        timeout_secs=180,
-    )
-    print_command_result(command, result, max_chars=12000)
-
-
-def prepare_extensions(client: McpStdioClient, session_id: str, skip_symbols: bool) -> None:
-    if not skip_symbols:
-        payload = client.call_tool(
-            "windbg_prepare_symbols",
-            {"session_id": session_id, "module": "nt"},
-            timeout_secs=180,
-        )
-        print(
-            "prepare_symbols:",
-            payload.get("success"),
-            payload.get("symbol_status"),
-            payload.get("pdb", {}).get("local_path"),
-        )
-    execute(client, session_id, ".load kdexts")
-
-
 def main() -> int:
     args = parse_args()
     client = McpStdioClient(args.exe)
-    opened_session_id: str | None = None
+    opened_name: str | None = None
     closed = False
     try:
         client.initialize("shadowgate-smoke")
-        opened_session_id = open_kernel_session(
+        info = open_kernel_session(
             client,
             args.connection,
-            args.session_id,
+            args.name,
             args.attach_timeout_secs,
+            startup_command=None if args.skip_symfix else ".symfix; .reload",
         )
-        ensure_command_ready(client, opened_session_id, args.ready_timeout_secs)
-        prepare_extensions(client, opened_session_id, args.skip_prepare_symbols)
+        opened_name = info["name"]
+        driver = CliDriver(opened_name, cli=args.cli)
+
+        driver.do("interrupt")
+        driver.exec(".load kdexts")
 
         commands = args.command or (
             LOAD_BREAK_COMMANDS if args.driver_load_break else DEFAULT_COMMANDS
@@ -160,57 +126,37 @@ def main() -> int:
 
         if args.driver_load_break:
             run_guest(args, f"sc stop {args.service}", check=False)
-            execute(client, opened_session_id, f"sxe ld:{args.driver_image}")
-            client.call_tool(
-                "windbg_resume_target",
-                {"session_id": opened_session_id},
-                timeout_secs=30,
-            )
+            driver.exec(f"sxe ld:{args.driver_image}")
+            driver.do("go")
             run_guest_async(args, f"sc start {args.service}")
-            state = wait_for_break(client, opened_session_id, args.ready_timeout_secs)
-            print("load_break:", state_name(state))
+            wb = driver.do("wait-break", "--timeout-secs", str(args.hit_timeout_secs))
+            if wb.returncode != 0:
+                raise RuntimeError("driver load break did not fire before timeout")
+            print("load_break: hit")
         else:
-            client.call_tool(
-                "windbg_resume_target",
-                {"session_id": opened_session_id},
-                timeout_secs=30,
-            )
+            driver.do("go")
             run_guest(args, f"sc start {args.service}", check=False)
             run_guest(args, f"sc query {args.service}", check=False)
             if args.probe_command:
                 run_guest(args, args.probe_command)
-            state = client.call_tool(
-                "windbg_interrupt_target",
-                {"session_id": opened_session_id},
-                timeout_secs=args.ready_timeout_secs,
-            ).get("state", {})
-            print("interrupted:", state_name(state))
+            driver.do("interrupt")
 
         for command in commands:
-            execute(client, opened_session_id, command)
+            driver.exec(command, timeout_secs=180)
 
-        client.call_tool(
-            "windbg_resume_target",
-            {"session_id": opened_session_id},
-            timeout_secs=30,
-        )
+        driver.do("go")
 
         if args.stop_service_after:
             time.sleep(2)
             run_guest(args, f"sc stop {args.service}", check=False)
 
-        close_kernel_session(client, opened_session_id, args.shutdown_timeout_secs)
+        close_session(client, opened_name)
         closed = True
         return 0
     finally:
-        if opened_session_id and not closed:
+        if opened_name and not closed:
             try:
-                close_kernel_session(
-                    client,
-                    opened_session_id,
-                    args.shutdown_timeout_secs,
-                    label="closed_after_error",
-                )
+                close_session(client, opened_name, force=True, label="closed_after_error")
             except Exception as exc:
                 print(f"close_after_error_failed: {exc}", file=sys.stderr)
         client.close()

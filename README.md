@@ -1,51 +1,75 @@
 # windbg-mcp-rs
 
-`windbg-mcp-rs` is a headless stdio MCP server that owns dbgeng sessions itself and can actively attach to kernel targets using the same `-k` connection options as WinDbg. Streamable HTTP remains available as an optional transport, but the maintained runtime is headless-only and no longer builds a WinDbg GUI extension DLL.
+`windbg-mcp-rs` is a **thin** stdio MCP server plus a full-featured debugger
+**CLI**, both built on a shared headless dbgeng engine.
 
-- Read official WinDbg command documentation extracted from `docs/debugger.chm`
-- Execute WinDbg commands through dbgeng
-- Read buffered command output history with cursor-based polling
-- Interrupt a running target from MCP
-- Resume a running target without blocking on a raw `g` command
-- Manage headless debugger sessions (`open`, `list`, `switch`, `close`)
-- Use the server from any MCP client over stdio by default, or Streamable HTTP when `--listen` is passed
-- Use higher-level reverse-engineering MCP tools for breakpoints, registers, memory, disassembly, backtraces, expressions, modules, symbols, DbgPrint output, and driver objects
+The design splits responsibilities so the MCP tool surface stays tiny while the
+debugging capability stays complete:
+
+- **MCP server (`windbg_mcp_headless`)** exposes only **three** tools —
+  `windbg_open_session`, `windbg_close_session`, `windbg_use_help`. It does not
+  hold a debugger session itself; it starts/stops `windbg_cli` daemons.
+- **CLI (`windbg_cli`)** owns the live dbgeng session inside a long-running
+  *daemon* process and performs all detailed debugging (breakpoints, memory,
+  registers, stepping, dumps, raw WinDbg commands). The agent runs it directly
+  from a shell.
+
+Because a dbgeng COM session cannot be shared across processes, the session
+lives in exactly one place — the CLI daemon — and the MCP server only
+orchestrates its lifecycle.
+
+## Why this split
+
+- Keeps the MCP tool count to 3, so MCP clients stay fast and uncluttered.
+- Preserves full WinDbg capability through `windbg_cli`.
+- The session survives across many CLI invocations (it is a persistent daemon),
+  so follow-up `windbg_cli do ...` calls inspect the same live target.
+
+## Architecture at a glance
+
+```
+MCP client ──stdio──> windbg_mcp_headless          (thin: open/close/help)
+                           │ spawns (detached)
+                           ▼
+                      windbg_cli daemon  ── owns dbgeng session ── target
+                           ▲
+   agent shell ── windbg_cli do --name <name> <action> ──┘  (bp/go/bt/mem/...)
+```
+
+Daemons register themselves under `%TEMP%\windbg_cli_daemons\<name>.json`
+(plus a `<name>.log`), and communicate over a loopback TCP control socket.
 
 ## Setup
 
-The recommended setup is to run `windbg_mcp_headless.exe` as a normal stdio MCP server and open debugger sessions on demand with `windbg_open_session`. This keeps KDNET keys and VM-specific connection strings out of the global MCP server configuration.
-
 ### Prerequisites
 
-- Windows host with Microsoft Debugging Tools / WinDbg Preview installed.
-- Rust toolchain with Cargo available on `PATH`.
+- Windows host with Microsoft Debugging Tools / WinDbg installed.
+- Rust toolchain with Cargo on `PATH`.
 - A writable symbol cache directory, for example `C:\Symbols`.
-- For kernel debugging, a target VM configured for KDNET and waiting for the debugger.
+- For kernel debugging, a target VM configured for KDNET and waiting.
 - An MCP client that supports stdio servers.
 
-### Build The Server
-
-Build the maintained headless binary:
+### Build
 
 ```powershell
-cargo build --release --bin windbg_mcp_headless
+cargo build --release
 ```
 
-The resulting server binary is:
+Resulting binaries:
 
 ```text
-target\release\windbg_mcp_headless.exe
+target\release\windbg_mcp_headless.exe   # thin MCP server
+target\release\windbg_cli.exe            # debugger CLI / daemon
 ```
 
-You can smoke-test the server from the repository root:
+The MCP server locates `windbg_cli.exe` automatically in this order:
 
-```powershell
-python tools\headless_mcp_smoke.py
-```
+1. `--cli-path <path>` flag.
+2. `WINDBG_CLI_PATH` environment variable.
+3. The MCP server's own directory (the usual case — keep both binaries together).
+4. `windbg_cli` on `PATH`.
 
-### Configure A Stdio MCP Client
-
-Point your MCP client at the release binary. A generic MCP JSON-style configuration looks like:
+### Configure a stdio MCP client
 
 ```json
 {
@@ -58,13 +82,7 @@ Point your MCP client at the release binary. A generic MCP JSON-style configurat
 }
 ```
 
-For Codex, add or replace the WinDbg MCP entry in the global config file:
-
-```text
-%USERPROFILE%\.codex\config.toml
-```
-
-Example Codex TOML:
+Codex TOML (`%USERPROFILE%\.codex\config.toml`):
 
 ```toml
 [mcp_servers.windbg_mcp_headless]
@@ -72,356 +90,106 @@ command = 'C:\path\to\windbg-mcp-rs\target\release\windbg_mcp_headless.exe'
 args = []
 ```
 
-If your client supports tool timeouts, set them generously. Some live KDNET commands, symbol downloads, and extension-backed commands can take tens of seconds.
-
-Avoid putting `--connect-kernel` and a KDNET key directly into the global MCP config unless you intentionally want every client startup to attach to the same VM. Prefer opening the session through MCP tool calls.
-
-### Run Manually During Development
-
-Start the default stdio MCP server:
-
-```powershell
-cargo run --bin windbg_mcp_headless --
-```
-
-Optionally start a Streamable HTTP MCP server instead of stdio:
+Optionally run over Streamable HTTP instead of stdio:
 
 ```powershell
 cargo run --bin windbg_mcp_headless -- --listen 127.0.0.1:50051
 ```
 
-For one-off HTTP or debugging experiments, the server can also open an initial KDNET session at startup:
-
-```powershell
-cargo run --bin windbg_mcp_headless -- `
-  --listen 127.0.0.1:50051 `
-  --connect-kernel "net:port=50000,key=<your-kdnet-key>" `
-  --session-id kdnet-main
-```
-
-The connection value accepts either raw WinDbg `-k` options:
-
-```text
-net:port=50000,key=<your-kdnet-key>
-```
-
-or a full launcher-style string:
-
-```text
-windbgx -k net:port=50000,key=<your-kdnet-key>
-```
-
-### Open A KDNET Session From MCP
-
-From the MCP client, call:
-
-```json
-{
-  "connection": "net:port=50000,key=<your-kdnet-key>",
-  "session_id": "kdnet-main",
-  "startup_command": ".sympath SRV*C:\\Symbols*https://msdl.microsoft.com/download/symbols",
-  "attach_timeout_secs": 90
-}
-```
-
-with tool:
-
-```text
-windbg_open_session
-```
-
-Then poll:
-
-```text
-windbg_get_execution_state
-```
-
-Expected early states:
-
-- `no_debuggee`: dbgeng is waiting for the target to reconnect. Wait and poll again.
-- `break`: the VM kernel is paused and debugger commands are accepted.
-- `go`: the VM is running. Use `windbg_interrupt_target` before inspection.
-
-If the session opens in `break`, inspect briefly or call:
-
-```text
-windbg_resume_target
-```
-
-For raw command output, use:
-
-```text
-windbg_execute_command
-windbg_get_output
-```
-
-`windbg_get_output` supports cursors so clients can read only newly buffered output after each command.
-
-### Minimal Kernel Driver Workflow
-
-A typical kernel-driver debugging loop is:
-
-```text
-windbg_open_session {"connection":"net:port=50000,key=<your-kdnet-key>","session_id":"kdnet-main","attach_timeout_secs":90}
-windbg_get_execution_state
-windbg_resume_target
-```
-
-Start or trigger the driver from the guest while the VM is running, then break only when debugger inspection is needed:
-
-```text
-windbg_interrupt_target
-windbg_prepare_symbols {"module":"nt"}
-windbg_execute_command ".load kdexts"
-windbg_driver_summary {"name":"ShadowGate","device":"\\Device\\ShadowGate"}
-windbg_set_driver_dispatch_breakpoints {"driver":"ShadowGate","functions":["IRP_MJ_DEVICE_CONTROL"]}
-windbg_resume_target
-```
-
-After the guest triggers an IOCTL and the breakpoint hits:
-
-```text
-windbg_continue_until_break {"timeout_secs":60}
-windbg_ioctl_snapshot {"buffer_count":132}
-windbg_read_registers
-windbg_read_memory {"address":"@rsp","format":"qwords","count":32}
-windbg_disassemble {"address":"@rip","count":16}
-windbg_backtrace {"format":"kv","count":32}
-windbg_resume_target
-```
-
-For Filter Manager communication-port drivers, break at the minifilter
-`MessageNotifyCallback` and use:
-
-```text
-windbg_minifilter_message_snapshot {"input_count":256}
-```
-
-This captures the callback registers, stack arguments, input/output buffers,
-message header, disassembly, and backtrace without forcing the workflow through
-IRP/IOCTL assumptions.
-
-Always resume or close cleanly when finished:
-
-```text
-windbg_close_session {"session_id":"kdnet-main"}
-```
-
-`windbg_close_session` resumes a broken kernel target before detach by default so the VM is not left paused.
-
-## User-Mode Debugging
-
-The same headless server also debugs local Windows user-mode processes through
-the new `windbg_open_user_process` MCP tool (or `--launch-user` /
-`--attach-user-pid` on the command line). Sessions opened this way share the
-catalog, breakpoint, register, memory, disassembly and stepping tools with
-kernel sessions; only the underlying dbgeng attach path differs.
-
-### Spawn A Debuggee From MCP
-
-```json
-{
-  "command_line": "C:\\path\\to\\app.exe arg1 arg2",
-  "session_id": "user-main",
-  "only_this_process": true,
-  "detach_on_exit": true,
-  "attach_timeout_secs": 30
-}
-```
-
-with tool:
-
-```text
-windbg_open_user_process
-```
-
-The engine sets `DEBUG_ENGOPT_INITIAL_BREAK`, so the session enters `break`
-right after the loader maps `ntdll`. From there standard reverse-engineering
-tools work the same as for kernel sessions.
-
-### Attach To An Existing PID
-
-```json
-{
-  "pid": 4242,
-  "session_id": "user-attach",
-  "non_invasive": false,
-  "detach_on_exit": true
-}
-```
-
-`non_invasive: true` issues
-`DEBUG_ATTACH_NONINVASIVE | DEBUG_ATTACH_NONINVASIVE_NO_SUSPEND`, useful for
-read-only inspection of a sensitive process.
-
-### Run From The Command Line
-
-```powershell
-target\release\windbg_mcp_headless.exe --launch-user "C:\path\to\app.exe"
-target\release\windbg_mcp_headless.exe --attach-user-pid 4242
-target\release\windbg_mcp_headless.exe --attach-user-pid 4242 --user-non-invasive
-```
-
-By default the spawned debuggee detaches when the session ends. Pass
-`--user-terminate-on-exit` to terminate it instead.
-
-### Smoke Test
-
-`tools/headless_user_mode_smoke.py` exercises the new path end-to-end:
-
-```powershell
-python tools\headless_user_mode_smoke.py --target C:\path\to\Crackme.exe --terminate-on-exit
-```
-
-It launches the binary, waits for the loader breakpoint, runs a small command
-suite (`.lastevent`, `vertarget`, `|.`, `lm m *`, `r`, `k`, `.symfix`), and
-closes the session.
-
-### User-Mode VA Software Breakpoints
-
-`windbg_set_process_breakpoint` automatically allows software `bp /p <EPROCESS>
-<user_va>` for sessions opened via `windbg_open_user_process`. The KDNET-only
-guard that recommends `windbg_set_hardware_breakpoint` instead is disabled
-when the active session is a user-mode session because plain `bp` is reliable
-on a local user-mode debug port.
-
-## Headless Session Tools
-
-Headless mode adds session-management tools:
-
-- `windbg_open_session`
-- `windbg_open_user_process`
-- `windbg_close_session`
-- `windbg_switch_session`
-- `windbg_list_sessions`
-- `windbg_current_session`
-- `windbg_recover_session`
-
-Live-target control is split into explicit tools:
-
-- `windbg_get_execution_state`
-- `windbg_get_output`
-- `windbg_interrupt_target`
-- `windbg_resume_target`
-- `windbg_execute_command`
-- `windbg_prepare_symbols`
-- `windbg_diagnose_extensions`
-- `windbg_dbgprint`
-
-Reverse-engineering convenience tools:
-
-- `windbg_set_breakpoint`
-- `windbg_set_hardware_breakpoint`
-- `windbg_trace_breakpoint`
-- `windbg_find_process`
-- `windbg_set_process_breakpoint`
-- `windbg_set_syscall_breakpoint`
-- `windbg_list_breakpoints`
-- `windbg_clear_breakpoint`
-- `windbg_continue_until_break`
-- `windbg_step`
-- `windbg_step_over`
-- `windbg_go_up`
-- `windbg_read_registers`
-- `windbg_write_register`
-- `windbg_read_memory`
-- `windbg_disassemble`
-- `windbg_backtrace`
-- `windbg_breakpoint_snapshot`
-- `windbg_evaluate_expression`
-- `windbg_list_modules`
-- `windbg_search_symbols`
-- `windbg_inspect_driver`
-- `windbg_set_driver_load_breakpoint`
-- `windbg_driver_summary`
-- `windbg_set_driver_dispatch_breakpoints`
-- `windbg_driver_dispatch_snapshot`
-- `windbg_ioctl_snapshot`
-- `windbg_minifilter_message_snapshot`
-
-`windbg_execute_command` intentionally blocks raw `sxd ld*` commands in
-headless mode. Live testing showed this dbgeng path can access-violate after a
-driver load event and kill the stdio MCP process. Leave driver-load filters in
-the short-lived session, clear normal breakpoints with `windbg_clear_breakpoint`,
-then resume or close the session.
-
-`windbg_set_hardware_breakpoint` wraps WinDbg `ba` for execute/read/write/io
-hardware breakpoints and watchpoints. Use it for self-modifying code or code
-pages where software `bp` patching is unsafe. It supports byte sizes 1/2/4/8,
-one-shot/pass-count command strings, and optional `/p <EPROCESS>` /
-`/t <ETHREAD>` scoping.
-
-`windbg_continue_until_break` now confirms a short stable break window before
-returning by default. This avoids treating transient break states as usable
-command-ready stops. Tune `settle_millis` or set `require_stable_break: false`
-only for specialized experiments.
-
-`windbg_step`, `windbg_step_over`, and `windbg_go_up` issue `t`, `p`, and `gu`
-respectively, then poll execution state until a stable command-ready break is
-available. This avoids the raw `gu` behavior observed in live testing where the
-command returned immediately while the target was still running.
-
-Raw multi-register commands such as `r rip rax rcx` are blocked in
-`windbg_execute_command`; live testing showed this form can leave dbgeng in a
-transient `0x80040205` state. Use `windbg_read_registers` with a `registers`
-array instead. The MCP reads each requested register as an isolated command.
-
-For trace-style breakpoint logging, prefer `windbg_trace_breakpoint` over raw
-command breakpoints such as `bp addr ".echo ...; r; dd ...; g"`. The tool sets a
-temporary software or hardware breakpoint, resumes the target, waits for a
-stable stop, runs capture commands synchronously through MCP, then clears and
-resumes by default. This makes the captured registers/memory/backtrace part of
-the tool result instead of relying on asynchronous dbgeng output callbacks.
-
-For process-scoped user-mode virtual addresses, prefer hardware execute
-breakpoints: `windbg_set_hardware_breakpoint {"address":"<user-va>","pid":"...",
-"access":"execute","size":1}`. Live KDNET testing showed software
-`bp /p <EPROCESS> <user_va>` can create a breakpoint ID without hitting
-reliably, so `windbg_set_process_breakpoint` rejects low user-mode VA software
-breakpoints by default unless `allow_user_software:true` is provided.
-
-`windbg_close_session` tries to resume a broken target before teardown by default; pass `resume_before_close: false` to skip that behavior. For live kernel sessions, close now performs multiple short resume/state verification passes before detaching, so delayed reconnects that fall back into `break` are less likely to leave the VM paused. It also accepts an optional `shutdown_timeout_secs` value. The session is removed from the MCP registry first, and the bounded shutdown result reports whether dbgeng teardown completed cleanly or timed out in the background. This keeps live KDNET detach issues from hanging the MCP server.
-
-`windbg_recover_session` is the safe recovery shortcut for long-running KDNET work: by default it checks the session state and resumes a broken target, returning structured before/after state and any recovery error. Set `interrupt_if_running: true` when you intentionally want the recovery action to break into a running target instead.
-
-If a text thread-list command such as `~` hits dbgeng's transient `0x80040205` command-window state after a synthetic load or breakpoint event, headless mode falls back to `IDebugSystemObjects` and returns a compact thread-id list instead of failing outright.
-
-For live KDNET sessions, shutdown is owned by the host client rather than the connected command client. This avoids dbgeng's nested `LoadModule` teardown error (`0x800700D7`) after driver-load breakpoints while keeping the guest running.
-
-### Headless Extension Loading
-
-Headless mode can use WinDbg extension commands such as `.load kdexts` and `!process` without relying on WinDbg Preview's protected `WindowsApps` install path directly. On Windows, the server discovers the installed WinDbg Preview package, copies the required `amd64`, `amd64\winext`, and `amd64\winxp` runtime files into:
+## MCP tools
+
+### `windbg_open_session`
+
+Starts (or idempotently reuses) a `windbg_cli` daemon for a target and returns
+its daemon `name`, loopback `address`, and `pid`.
+
+| field | type | required | meaning |
+|---|---|---|---|
+| `mode` | `"launch" \| "attach" \| "kernel"` | yes | target kind |
+| `command_line` | string | launch | exe path + args |
+| `follow_children` | bool | no | also debug child processes |
+| `pid` | u32 | attach | process id to attach to |
+| `non_invasive` | bool | no | non-invasive attach |
+| `connection` | string | kernel | `-k`-style connection string |
+| `name` | string | no | daemon name (auto-generated if omitted) |
+| `startup_command` | string | no | run right after the initial break |
+| `symfix` | bool | no | run `.symfix; .reload` first |
+| `attach_timeout_secs` | u64 | no | initial attach timeout |
+| `ready_timeout_secs` | u64 | no | readiness wait timeout |
+
+Reusing a live daemon name returns the existing session (idempotent) without
+disturbing the current debugging state.
+
+### `windbg_close_session`
+
+| field | type | required | meaning |
+|---|---|---|---|
+| `name` | string | yes | daemon name |
+| `force` | bool | no | kill an unreachable daemon + clean stale registry |
+
+### `windbg_use_help`
+
+Returns concise usage. Optional `topic`: `"workflow"`, `"open"`, `"do"`,
+`"daemon"`. For exhaustive flags, run `windbg_cli --help` and
+`windbg_cli do --help`.
+
+The command catalog extracted from `docs/debugger.chm` is also available as MCP
+*resources* (`windbg://command/{id}` and the guide) for syntax lookups.
+
+## Workflow
+
+1. Call `windbg_open_session` with a target. Save the returned `name`.
+2. Drive debugging from a shell against that daemon:
+
+   ```powershell
+   windbg_cli do --name <name> state
+   windbg_cli do --name <name> bp nt!NtCreateFile
+   windbg_cli do --name <name> go
+   windbg_cli do --name <name> wait-break --timeout-secs 30
+   windbg_cli do --name <name> bt
+   windbg_cli do --name <name> exec "u @rip L8"
+   ```
+3. Call `windbg_close_session` with the same `name` when finished.
+
+### `windbg_cli do` actions
+
+`state`, `go`, `interrupt`, `wait-break`, `step`, `step-over`, `step-out`,
+`step-until`, `bp`, `ba`, `bc`, `bl`, `reg`, `mem`, `dis`, `bt`, `snapshot`,
+`dump`, `exec`, `info`. Run `windbg_cli do --help` for exact flags.
+
+`exec` runs any raw WinDbg command; the same unsafe-command blocklist that
+applied to the old MCP `execute_command` still applies.
+
+### `windbg_cli` top-level commands
+
+- `daemon start|stop|status|list` — manage persistent debugger daemons.
+- `do <action>` — send one action to a running daemon.
+- `kernel <connection>` — one-shot kernel session (no daemon).
+- `list-tools` — print the legacy tool-name listing.
+
+## Extension loading and symbols
+
+The daemon can use WinDbg extension commands (`.load kdexts`, `!process`, etc.)
+without depending on WinDbg's protected `WindowsApps` path. On Windows it
+discovers the installed WinDbg package, copies the required `amd64`,
+`amd64\winext`, and `amd64\winxp` runtime files into:
 
 ```text
 %LOCALAPPDATA%\windbg-mcp-rs\dbgeng-cache
 ```
 
-It then appends the cached extension directories to `.extpath`. Commands such as `.load kdexts` are resolved to the cached DLL path automatically.
+and appends the cached extension directories to `.extpath`.
 
-By default, live KDNET sessions keep using the system `dbgeng.dll`, which has been more stable for target resume/close behavior, while extensions load from the local cache. Advanced overrides:
+Advanced overrides:
 
-- `WINDBG_MCP_DBGENG_PATH`: force a specific `dbgeng.dll`.
-- `WINDBG_MCP_DEBUGGER_ROOT`: force a debugger root that contains `amd64\dbgeng.dll`.
-- `WINDBG_MCP_USE_PREVIEW_DBGENG=1`: opt into the cached WinDbg Preview `dbgeng.dll`.
+- `WINDBG_MCP_DBGENG_PATH` — force a specific `dbgeng.dll`.
+- `WINDBG_MCP_DEBUGGER_ROOT` — force a debugger root containing `amd64\dbgeng.dll`.
+- `WINDBG_MCP_USE_PREVIEW_DBGENG=1` — opt into the cached WinDbg Preview `dbgeng.dll`.
+- `WINDBG_MCP_SYMBOL_CACHE` — override the default `C:\Symbols` cache.
 
-Extension-backed commands still depend on symbols. Use `windbg_prepare_symbols` before commands such as `!process 0 0` or `!drvobj ShadowGate 7` when the target reports incorrect NT symbols. The tool reads `!lmi <module>`, downloads the exact CodeView PDB from the configured symbol server, appends the exact PDB directory to `.sympath`, and reloads the module. It defaults to module `nt`, cache directory `C:\Symbols`, and `https://msdl.microsoft.com/download/symbols`; override the cache per call with `symbol_cache` or globally with `WINDBG_MCP_SYMBOL_CACHE`.
-
-If extension loading or an extension-backed command still fails, call `windbg_diagnose_extensions`. It collects the effective `.extpath`, loaded extension chain, optional symbol preparation, extension load output, probe command output, and remediation hints without requiring the client to manually stitch those checks together.
-
-Use `windbg_dbgprint` while the target is command-ready to retrieve kernel `DbgPrint` output through `!dbgprint`. The tool loads `kdexts` by default, returns a bounded tail (`lines`, default 200, max 5000), and only includes full raw output when `include_raw_output:true` is passed. If the extension reports symbol issues, retry with `prepare_symbols:true` or call `windbg_prepare_symbols {"module":"nt"}` first.
-
-## What MCP Exposes
-
-- `Resources`: a low-context guide resource and compact/full WinDbg command documentation resources
-- `Tools`: a compact toolset for catalog search, execution-state query, command execution, target interrupt/resume, exact PDB preparation, extension diagnostics, reverse-engineering convenience actions, and headless session management
-
-Pure UI shortcut topics remain available as documentation, and command execution is exposed through a single `windbg_execute_command` tool.
-
-Recommended agent flow in headless mode: call `windbg_open_session`, optionally `windbg_switch_session`, then follow the same command flow. If extension commands need kernel symbols, call `windbg_prepare_symbols` while broken into the target, and use `windbg_diagnose_extensions` when `.load kdexts` or `!process` is not behaving as expected. Use `windbg_dbgprint` for recent kernel `DbgPrint` messages when the target is broken into a command-ready state. If the debugger is running or busy, call `windbg_interrupt_target` explicitly and verify state again before executing the command. Use `windbg_resume_target` to continue execution without issuing a raw `g` command. Use `windbg_get_output` with the returned `next_cursor` to fetch only newly buffered command output.
-
-Recommended breakpoint flow: call `windbg_set_breakpoint` or `windbg_set_hardware_breakpoint`, call `windbg_continue_until_break`, then call `windbg_breakpoint_snapshot` or targeted tools such as `windbg_read_registers`, `windbg_read_memory`, `windbg_disassemble`, and `windbg_backtrace`. For one-shot trace logging, call `windbg_trace_breakpoint` instead; it owns set/resume/wait/capture/cleanup in one MCP call. For noisy kernel syscalls, call `windbg_find_process` and then `windbg_set_process_breakpoint` or `windbg_set_syscall_breakpoint`; these use WinDbg's native kernel `bp /p <EPROCESS>` support so `NtCreateFile` / `NtDeviceIoControlFile` tracing can be scoped to `ShadowGateApp.exe`, `maze_probe.exe`, or a specific PID. Use `windbg_step`, `windbg_step_over`, or `windbg_go_up` for instruction-level dynamic reversing while keeping the MCP from returning until the temporary step stop is usable.
-
-Recommended kernel-driver flow: call `windbg_set_driver_load_breakpoint` before starting the driver; it prepares `nt` symbols by default before configuring `sxe ld:<image>` so later driver-object inspection avoids dbgeng's unstable "prepare symbols after load-filter mutation" path. Continue until the load event, then call `windbg_driver_summary` to collect `lm`, `!drvobj`, object/device checks, and parsed `IRP_MJ_*` dispatch routines. Use `windbg_set_driver_dispatch_breakpoints` to place breakpoints on dispatch handlers such as `IRP_MJ_DEVICE_CONTROL`, then use `windbg_driver_dispatch_snapshot` at dispatch entry or `windbg_ioctl_snapshot` at IOCTL-specific breakpoints to collect registers, `!irp`, parsed IOCTL input/output lengths and code, SystemBuffer memory and byte prefix, stack, RIP disassembly, and current breakpoints. `windbg_ioctl_snapshot` auto-detects common IRP registers by default, which helps when a handler has cached the IRP after the normal dispatch entry. Use `windbg_evaluate_expression`, `windbg_list_modules`, `windbg_search_symbols`, and `windbg_inspect_driver` for lower-level symbol/module/driver-object checks.
+Extension-backed commands depend on symbols. When NT symbols are wrong, run
+`windbg_cli do --name <name> exec ".symfix; .reload"` (or open the session with
+`symfix: true` / `startup_command`) before commands such as `!process 0 0`.
 
 ## Development
 
@@ -430,50 +198,42 @@ cargo check
 cargo test
 ```
 
-Run the stdio smoke helper after building the release binary:
+Protocol smoke test (no target required) — verifies the MCP surface is exactly
+the three tools and that `use_help` is clean:
 
 ```powershell
-python tools/headless_mcp_smoke.py
+python tools\headless_mcp_smoke.py
 ```
 
-Live KDNET regression helpers are available for deeper checks:
+End-to-end user-mode test (spawns a local binary, drives it through the CLI,
+closes via MCP):
 
 ```powershell
-python tools/headless_trace_breakpoint_smoke.py --connection "<kdnet>" --location "<addr-or-symbol>"
-python tools/headless_user_va_breakpoint_smoke.py --connection "<kdnet>" --process-name "<app.exe>" --location "<user-va>"
+python tools\headless_user_mode_smoke.py --target C:\path\to\app.exe
 ```
 
-To validate a live KDNET session, pass your own connection string:
+Live KDNET regression helpers (require hardware/VM and a connection string).
+Each opens a kernel daemon via MCP and drives it through `windbg_cli do`:
 
-```powershell
-python tools/headless_mcp_smoke.py `
-  --connection "net:port=50000,key=<your-kdnet-key>" `
-  --session-id kdnet-smoke `
-  --command vertarget
-```
+- `tools/headless_kdnet_soak.py` — repeats interrupt/exec/go cycles.
+- `tools/headless_get_output_check.py` — verifies command output markers.
+- `tools/headless_extension_smoke.py` — loads `kdexts` and runs probes.
+- `tools/headless_syscall_breakpoint_smoke.py` — process-scoped syscall breakpoints.
+- `tools/headless_trace_breakpoint_smoke.py` — set/resume/wait/snapshot.
+- `tools/headless_user_va_breakpoint_smoke.py` — process-scoped user-VA breakpoints.
+- `tools/shadowgate_smoke.py` — ShadowGate service/load-break inspection over SSH.
 
-The live smoke helper waits through transient `no_debuggee` states, interrupts a running target before executing commands, and closes the session through MCP cleanup even if a command fails.
-
-Additional tracked validation helpers:
-
-- `tools/headless_extension_smoke.py`: prepares symbols, loads `kdexts`, and runs extension-backed probes.
-- `tools/headless_get_output_check.py`: verifies cursor-based `windbg_get_output` reads.
-- `tools/headless_kdnet_soak.py`: repeats `interrupt -> execute -> resume` cycles and can probe guest TCP reachability.
-- `tools/headless_syscall_breakpoint_smoke.py`: validates process-scoped syscall breakpoint setup and can optionally launch a trigger command.
-- `tools/shadowgate_smoke.py`: drives ShadowGate service/load-break inspections when guest SSH is available.
-
-For day-to-day operating guidance, see `docs/headless-operator-guide.md`. Driver-debugging implementation details are tracked in `docs/kernel-driver-debugging-implementation.md`. For output cursor regression coverage, see `docs/get-output-regression-plan.md`.
-ShadowGate-specific observations are tracked in `docs/shadowgate-notes.md`.
+Operating guidance lives in `docs/headless-operator-guide.md`; driver-debugging
+details in `docs/kernel-driver-debugging-implementation.md`.
 
 ## Notes
 
-- This project was written entirely with a Vibe Coding workflow
-- The server runs as an ordinary Rust process and owns dbgeng sessions directly
-- For live KDNET sessions, the owned dbgeng host now stays broken after a successful break-in and only resumes when `windbg_resume_target` is called
-- The runtime does not parse `docs/debugger.chm`; it uses the prebuilt static catalog in `src/catalog.json`
-- The default transport is stdio
-- Streamable HTTP is optional through `--listen`
-- Set your MCP client timeout as high as possible, because some WinDbg operations can take a long time to finish
-- `no_debuggee` right after opening a live KDNET session is expected; wait for reconnect before executing commands
-- While the target is broken, the guest kernel is paused and SSH can appear down until `windbg_resume_target` or `windbg_recover_session`
-- Synthetic driver-load handling can still have cosmetic module-display quirks; for ShadowGate, `!drvobj ShadowGate 7` is currently more reliable than `lm m ShadowGate*` after a normal service start
+- This project was written with a Vibe Coding workflow.
+- The MCP server is stateless w.r.t. debugging; the dbgeng session lives only in
+  the `windbg_cli` daemon process.
+- The runtime does not parse `docs/debugger.chm`; it uses the prebuilt static
+  catalog in `src/catalog.json`.
+- Default transport is stdio; Streamable HTTP is optional via `--listen`.
+- Set your MCP client timeout high — some WinDbg operations take tens of seconds.
+- For live KDNET, `no_debuggee` right after opening is expected; wait for the
+  target to reconnect. While broken in, the guest kernel is paused.

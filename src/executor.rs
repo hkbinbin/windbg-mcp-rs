@@ -52,6 +52,8 @@ pub enum ExecutionError {
     Session(String),
     #[error("this execution mode is only available on Windows")]
     WindowsOnly,
+    #[error("{0}")]
+    Blocked(String),
 }
 
 pub enum ExecutionMode {

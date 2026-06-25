@@ -206,3 +206,36 @@
   Verified end-to-end with `tools/headless_user_mode_smoke.py` against
   `Crackme.exe` (32-bit launch with WoW64 module list, registers, stack
   backtrace) and against an existing notepad PID (`AttachPid` path).
+
+## Architecture: Thin MCP + CLI daemon
+
+- [x] Slim the MCP server down to three tools (`windbg_open_session`,
+  `windbg_close_session`, `windbg_use_help`) and move all detailed debugging
+  to the `windbg_cli` daemon driven directly from a shell.
+  The dbgeng session now lives only in the CLI daemon process (it cannot be
+  shared across processes). `windbg_open_session` detached-spawns
+  `windbg_cli daemon start`, polls the `%TEMP%\windbg_cli_daemons\<name>.json`
+  registry until connectable, and returns the daemon name/address/pid;
+  `windbg_close_session` sends Shutdown (with `force` for stale daemons);
+  open is idempotent for a live same-named daemon. Shared registry + wire
+  protocol moved to `src/daemon.rs`; lifecycle plumbing in
+  `src/daemon_launcher.rs`. The 40+ old per-action MCP tools were removed from
+  `src/server.rs` (the underlying `executor`/`session_manager` engine is kept,
+  since the CLI depends on it). `tools/*.py` smoke scripts were migrated to the
+  open-via-MCP / drive-via-`windbg_cli do` / close-via-MCP model. Verified
+  end-to-end: notepad launch → `do state/exec` → close, with no leftover daemon
+  or registry entry.
+
+- [x] Full real-target debug regression covering every CLI method.
+  Added `tools/full_debug_test.py`: opens notepad via MCP, exercises all 21
+  `windbg_cli do` actions (state/info/reg/bl/bp/ba/bc/mem/dis/bt/snapshot/
+  exec/step/step-over/step-out/step-until/go/interrupt/wait-break/dump) plus
+  daemon status/list and idempotent re-open, then closes via MCP and verifies
+  the registry entry is gone — 44/44 checks pass on a live notepad target.
+  Fixed a regression introduced by the slim-down: the
+  `blocked_unsafe_debugger_command` guard (rejects crash-prone `sxd ld*` and
+  fragile multi-register `r` reads) had lived only in the deleted server.rs
+  `execute_command`. It now lives in the shared
+  `session_manager::execute_command` (new `ExecutionError::Blocked`), so both
+  the CLI `do exec` path and any MCP caller are protected. Covered by two new
+  unit tests.

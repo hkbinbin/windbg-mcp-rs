@@ -2,54 +2,116 @@ use crate::catalog::{Catalog, CatalogEntry, ToolRouting};
 
 pub const GUIDE_URI: &str = "windbg://guide/overview";
 
+/// Render the overview guide for the thin MCP server.
+///
+/// The MCP surface is intentionally tiny — only `windbg_open_session`,
+/// `windbg_close_session`, and `windbg_use_help`. All detailed debugging is
+/// driven by the `windbg_cli` executable, which the agent runs directly from a
+/// shell. This guide explains that split and points at `windbg_cli --help`.
 pub fn render_guide(catalog: &Catalog) -> String {
-    let mut output = String::new();
-    output.push_str("WinDbg MCP overview\n\n");
-    output.push_str("Use resources to decide what to execute before calling tools.\n\n");
-    output.push_str("Low-context workflow\n");
-    output.push_str("--------------------\n");
-    output.push_str("1. If the user request is not already a precise WinDbg command, call `windbg_search_catalog`.\n");
-    output.push_str("2. Read `windbg://command/{id}` for the best match. It keeps only the metadata and syntax needed to build the command string.\n");
-    output.push_str(
-        "3. Read `windbg://command-full/{id}` only when the compact card is not enough.\n",
-    );
-    output.push_str("4. Call `windbg_get_execution_state` before execution.\n");
-    output.push_str("5. If the debugger is running or busy, call `windbg_interrupt_target`, then re-check state.\n");
-    output.push_str(
-        "6. Call `windbg_execute_command` only when the debugger is ready for commands. Use `windbg_resume_target` when you want to continue execution without blocking on a raw `g` command.\n\n",
-    );
-    output.push_str("Key resources\n");
-    output.push_str("-------------\n");
-    output.push_str(&format!("- Guide: {}\n", GUIDE_URI));
-    output.push_str(&format!(
-        "- Compact command card template: {}\n",
-        catalog.command_template_uri()
-    ));
-    output.push_str(&format!(
-        "- Full command page template: {}\n\n",
-        catalog.full_command_template_uri()
-    ));
-    output.push_str("Key tools\n");
-    output.push_str("---------\n");
-    output.push_str("- windbg_search_catalog\n");
-    output.push_str("- windbg_get_execution_state\n");
-    output.push_str("- windbg_interrupt_target\n");
-    output.push_str("- windbg_resume_target\n");
-    output.push_str("- windbg_execute_command\n");
-    output.push_str("- windbg_set_breakpoint / windbg_continue_until_break\n");
-    output.push_str("- windbg_find_process / windbg_set_process_breakpoint\n");
-    output.push_str("- windbg_set_syscall_breakpoint\n");
-    output.push_str("- windbg_read_registers / windbg_read_memory\n");
-    output.push_str("- windbg_disassemble / windbg_backtrace\n");
-    output.push_str("- windbg_breakpoint_snapshot\n");
-    output.push_str("- windbg_evaluate_expression / windbg_search_symbols\n");
-    output.push_str("- windbg_list_modules / windbg_inspect_driver\n\n");
-    output.push_str("- windbg_set_driver_load_breakpoint / windbg_driver_summary\n");
-    output.push_str(
-        "- windbg_set_driver_dispatch_breakpoints / windbg_driver_dispatch_snapshot / windbg_ioctl_snapshot\n\n",
-    );
-    output.push_str(&catalog.render_index());
-    output
+    render_help(catalog, None)
+}
+
+/// Render help text, optionally focused on a single `topic`.
+///
+/// Supported topics: `workflow`, `open`, `do`, `daemon`. Any other value (or
+/// `None`) yields the full overview.
+pub fn render_help(catalog: &Catalog, topic: Option<&str>) -> String {
+    let mut out = String::new();
+
+    match topic {
+        Some("open") => {
+            out.push_str(&section_open());
+        }
+        Some("do") => {
+            out.push_str(&section_do());
+        }
+        Some("daemon") => {
+            out.push_str(&section_daemon());
+        }
+        Some("workflow") => {
+            out.push_str(&section_workflow());
+        }
+        _ => {
+            out.push_str("WinDbg MCP — thin server overview\n");
+            out.push_str("=================================\n\n");
+            out.push_str(
+                "This MCP server exposes only three tools. Heavy debugging is done by\n\
+                 running the `windbg_cli` executable directly from a shell, which keeps the\n\
+                 MCP tool surface small while preserving full capability.\n\n",
+            );
+            out.push_str("MCP tools\n---------\n");
+            out.push_str("- windbg_open_session  : start (or reuse) a debugger daemon for a target\n");
+            out.push_str("- windbg_close_session : stop a debugger daemon\n");
+            out.push_str("- windbg_use_help      : this help (optional `topic`)\n\n");
+            out.push_str(&section_workflow());
+            out.push('\n');
+            out.push_str(&section_open());
+            out.push('\n');
+            out.push_str(&section_do());
+            out.push('\n');
+            out.push_str(&section_daemon());
+            out.push('\n');
+            out.push_str("Catalog search\n--------------\n");
+            out.push_str(&format!(
+                "- Command catalog is still available as resources: {}\n",
+                catalog.command_template_uri()
+            ));
+            out.push_str(&format!("- Guide resource: {}\n", GUIDE_URI));
+        }
+    }
+
+    out
+}
+
+fn section_workflow() -> String {
+    let mut s = String::new();
+    s.push_str("Workflow\n--------\n");
+    s.push_str("1. Call `windbg_open_session` with a target (launch/attach/kernel). It returns\n");
+    s.push_str("   a daemon `name` (and loopback address) that owns the live session.\n");
+    s.push_str("2. Run debugger actions from a shell against that daemon:\n");
+    s.push_str("     windbg_cli do --name <name> <action> [args]\n");
+    s.push_str("   e.g. `windbg_cli do --name <name> bp nt!NtCreateFile`,\n");
+    s.push_str("        `windbg_cli do --name <name> go`, `windbg_cli do --name <name> bt`.\n");
+    s.push_str("3. Call `windbg_close_session` with the same `name` when finished.\n");
+    s.push_str("For the full action list run: `windbg_cli do --help`.\n");
+    s
+}
+
+fn section_open() -> String {
+    let mut s = String::new();
+    s.push_str("Opening a session (windbg_open_session)\n");
+    s.push_str("---------------------------------------\n");
+    s.push_str("mode = \"launch\" : spawn a user-mode exe   (command_line, follow_children?)\n");
+    s.push_str("mode = \"attach\" : attach to a PID         (pid, non_invasive?)\n");
+    s.push_str("mode = \"kernel\" : KDNET-style connection  (connection)\n");
+    s.push_str("Optional: name, startup_command, symfix, attach_timeout_secs, ready_timeout_secs.\n");
+    s.push_str("Omitting `name` generates a unique daemon name; reusing a live name is idempotent.\n");
+    s
+}
+
+fn section_do() -> String {
+    let mut s = String::new();
+    s.push_str("Running debugger commands (shell, not MCP)\n");
+    s.push_str("------------------------------------------\n");
+    s.push_str("Use the CLI directly: `windbg_cli do --name <name> <action>`. Actions include:\n");
+    s.push_str("  state | go | interrupt | wait-break | step | step-over | step-out | step-until\n");
+    s.push_str("  bp | ba | bc | bl | reg | mem | dis | bt | snapshot | dump | exec | info\n");
+    s.push_str("`exec` runs a raw WinDbg command, e.g. `windbg_cli do --name <name> exec \"u @rip L8\"`.\n");
+    s.push_str("Run `windbg_cli do --help` for exact flags of each action.\n");
+    s
+}
+
+fn section_daemon() -> String {
+    let mut s = String::new();
+    s.push_str("windbg_cli top-level commands\n");
+    s.push_str("-----------------------------\n");
+    s.push_str("- daemon start|stop|status|list : manage persistent debugger daemons\n");
+    s.push_str("- do <action>                   : send one action to a running daemon\n");
+    s.push_str("- kernel <connection>           : one-shot kernel session (no daemon)\n");
+    s.push_str("- list-tools                    : print legacy tool name listing\n");
+    s.push_str("Run `windbg_cli --help` for the complete CLI reference.\n");
+    s
 }
 
 pub fn render_compact_command(entry: &CatalogEntry) -> String {
@@ -79,13 +141,13 @@ pub fn render_compact_command(entry: &CatalogEntry) -> String {
     output.push_str("\nNext Step\n---------\n");
     match entry.tool_routing() {
         ToolRouting::ExecuteCommand => output.push_str(
-            "Build the final WinDbg command string from the syntax above, call `windbg_get_execution_state`, interrupt if needed, and then call `windbg_execute_command`. Use `windbg_resume_target` when you want to continue execution without issuing a raw `g` command.\n",
+            "Build the final WinDbg command string from the syntax above and run it against a daemon: `windbg_cli do --name <name> exec \"<command>\"`. Check state first with `windbg_cli do --name <name> state`.\n",
         ),
         ToolRouting::InterruptTarget => output.push_str(
-            "This topic maps to an engine-level break action. Use `windbg_interrupt_target` instead of `windbg_execute_command`.\n",
+            "This topic maps to an engine-level break action. Use `windbg_cli do --name <name> interrupt` instead of a raw command.\n",
         ),
         ToolRouting::DocumentationOnly => output.push_str(
-            "This topic is documentation-only in MCP because it describes a UI shortcut or non-text action.\n",
+            "This topic is documentation-only because it describes a UI shortcut or non-text action.\n",
         ),
     }
 
