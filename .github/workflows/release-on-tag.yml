@@ -52,12 +52,16 @@ jobs:
         run: |
           $assetDir = "dist"
           $archiveName = "windbg-mcp-rs-${{ github.ref_name }}-windows-x64.zip"
+          $skillArchive = "windbg-cli-skill-${{ github.ref_name }}.zip"
 
           New-Item -ItemType Directory -Path $assetDir -Force | Out-Null
 
           # The two binaries that make up a working install.
           Copy-Item "target/release/windbg_mcp_headless.exe" "$assetDir/windbg_mcp_headless.exe"
           Copy-Item "target/release/windbg_cli.exe"          "$assetDir/windbg_cli.exe"
+
+          # Bundle the agent skill so the all-in-one zip is complete.
+          Copy-Item "skills" "$assetDir/skills" -Recurse -Force
 
           # A short usage note so the zip is self-explanatory.
           @"
@@ -66,6 +70,7 @@ jobs:
           Contents:
             windbg_mcp_headless.exe  Thin MCP server (open/close session + help).
             windbg_cli.exe           Debugger CLI / daemon. Drives all debugging.
+            skills/windbg-cli/       Agent skill: how to debug with these tools.
 
           IMPORTANT: keep both .exe files in the SAME folder. The MCP server
           starts windbg_cli.exe (located next to itself) to host debugger
@@ -83,13 +88,20 @@ jobs:
 
           Then: windbg_open_session -> windbg_cli do --name <name> <action> -> windbg_close_session
           Run `windbg_cli --help` and `windbg_cli do --help` for the full action list.
+
+          To install the agent skill, copy skills/windbg-cli into your
+          ~/.workbuddy/skills/ directory (see skills/README.md).
           "@ | Set-Content -Path "$assetDir/README.txt" -Encoding utf8
 
           Compress-Archive -Path "$assetDir/*" -DestinationPath $archiveName -Force
 
-          # SHA-256 for the archive and each loose binary.
+          # Standalone skill zip (for users who already have the binaries).
+          Compress-Archive -Path "skills/windbg-cli", "skills/README.md" -DestinationPath $skillArchive -Force
+
+          # SHA-256 for the archives and each loose binary.
           $items = @(
             $archiveName,
+            $skillArchive,
             "$assetDir/windbg_mcp_headless.exe",
             "$assetDir/windbg_cli.exe"
           )
@@ -109,7 +121,10 @@ jobs:
           artifacts: |
             windbg-mcp-rs-${{ github.ref_name }}-windows-x64.zip
             windbg-mcp-rs-${{ github.ref_name }}-windows-x64.zip.sha256
+            windbg-cli-skill-${{ github.ref_name }}.zip
+            windbg-cli-skill-${{ github.ref_name }}.zip.sha256
             dist/windbg_mcp_headless.exe
             dist/windbg_mcp_headless.exe.sha256
             dist/windbg_cli.exe
             dist/windbg_cli.exe.sha256
+
