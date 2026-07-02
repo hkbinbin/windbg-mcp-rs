@@ -301,6 +301,51 @@ enum DoAction {
     /// Snapshot at the current break: `.lastevent` + `r` + `u @eip L8` +
     /// `kv 16` + `bl`.
     Snapshot,
+    /// Search committed, readable memory for a byte pattern or a string.
+    ///
+    /// Provide exactly one of `--bytes` or `--string`. For strings, choose the
+    /// encoding(s) with `--encoding` (default: all — utf8, utf16le, and gbk —
+    /// so ASCII, wide-char, and Chinese strings are all covered).
+    ///
+    /// Scope (pick one): default scans every loaded module's image range
+    /// (enumerated via `lm`, works without symbols); `--all` scans the WHOLE
+    /// user address space including private/heap memory (VirtualAlloc'd
+    /// regions) — that is where injected/hidden secrets live; `--module`
+    /// narrows to matching modules; `--start`+`--len` searches an explicit
+    /// window.
+    Search {
+        /// Byte pattern as space- or comma-separated hex, e.g.
+        /// "48 8b 05" or "48,8b,05". Mutually exclusive with `--string`.
+        #[arg(long)]
+        bytes: Option<String>,
+        /// Text to search for. Converted to bytes per `--encoding`. Supports
+        /// ASCII and Chinese (e.g. --string "密码"). Mutually exclusive with
+        /// `--bytes`.
+        #[arg(long)]
+        string: Option<String>,
+        /// Encoding(s) for `--string`: `utf8`, `utf16le` (Windows wide), `gbk`
+        /// (Chinese ANSI), or `all` (default). Repeatable or comma-separated.
+        #[arg(long, default_value = "all")]
+        encoding: String,
+        /// Scan the entire user address space (0 .. 0x7FFFFFFFFFFF), including
+        /// private/heap/VirtualAlloc'd memory. dbgeng skips unmapped pages, so
+        /// this is the way to find secrets that are NOT in any module image.
+        #[arg(long, default_value_t = false)]
+        all: bool,
+        /// Only search modules whose name contains this substring
+        /// (case-insensitive), e.g. `--module notepad`.
+        #[arg(long)]
+        module: Option<String>,
+        /// Explicit start address (hex) for a bounded search. Requires `--len`.
+        #[arg(long)]
+        start: Option<String>,
+        /// Byte length for an explicit `--start` range (hex `0x...` or decimal).
+        #[arg(long)]
+        len: Option<String>,
+        /// Stop after this many total hits (0 = unlimited). Default 256.
+        #[arg(long, default_value_t = 256)]
+        max_hits: u32,
+    },
     /// Real-time dump: capture the full process memory (as a /ma minidump)
     /// and the raw bytes of every loaded module to `<out_dir>`. The daemon
     /// auto-interrupts the target if it is running; nothing is detached.
@@ -798,6 +843,28 @@ fn handle_request(
             }
             Response::ok(clamp(&buf, max_output_chars))
         }
+        Request::Search {
+            pattern_hex,
+            label,
+            module_filter,
+            all,
+            start,
+            range_len,
+            max_hits,
+        } => handle_search(
+            manager,
+            session_id,
+            ready_timeout_secs,
+            max_output_chars,
+            rt,
+            &pattern_hex,
+            label.as_deref(),
+            module_filter.as_deref(),
+            all,
+            start.as_deref(),
+            range_len.as_deref(),
+            max_hits,
+        ),
         Request::Dump {
             out_dir,
             minidump,
@@ -1093,6 +1160,261 @@ fn handle_dump(
 }
 
 
+// ---------------------------------------------------------------------------
+// Memory search.
+// ---------------------------------------------------------------------------
+
+/// Parse a hex-byte pattern string like "48 8b 05", "48,8b,05" or "488b05"
+/// into raw bytes.
+fn parse_hex_pattern(s: &str) -> Result<Vec<u8>, String> {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ',' && *c != '-')
+        .collect();
+    if cleaned.is_empty() {
+        return Err("empty byte pattern".into());
+    }
+    if cleaned.len() % 2 != 0 {
+        return Err(format!(
+            "hex pattern must have an even number of nibbles, got {} chars",
+            cleaned.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(cleaned.len() / 2);
+    let bytes = cleaned.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid hex digit `{}`", bytes[i] as char))?;
+        let lo = (bytes[i + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid hex digit `{}`", bytes[i + 1] as char))?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Ok(out)
+}
+
+/// Format raw bytes as a space-separated hex string for WinDbg `s -b`.
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One (bytes, human-label) search needle produced from the request.
+struct Needle {
+    hex: String,
+    label: String,
+}
+
+/// Parse a WinDbg `s` hit line's leading address, tolerating the backtick
+/// split used on 64-bit targets, e.g. "00007ff7`dbb1ecd2  4e 6f ...".
+fn parse_hit_address(line: &str) -> Option<String> {
+    let token = line.split_whitespace().next()?;
+    // Must look like a hex address (optionally with a backtick).
+    let cleaned: String = token.chars().filter(|c| *c != '`').collect();
+    if cleaned.is_empty() || !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    // Normalize to a plain 0x-prefixed address.
+    let value = u64::from_str_radix(&cleaned, 16).ok()?;
+    Some(format!("0x{value:016x}"))
+}
+
+/// Enumerate the (base, end, name) regions to scan.
+///
+/// Without symbols, `!address` is unreliable, so we use the loaded-module
+/// table (`lm n`) as the region source — that reliably covers every mapped
+/// image, which is where searchable strings/code live. Callers who need an
+/// arbitrary region (heap, stack, a specific VA window) pass an explicit
+/// start+len instead.
+fn collect_search_regions(
+    manager: &Arc<HeadlessSessionManager>,
+    session_id: &str,
+    module_filter: Option<&str>,
+    rt: &tokio::runtime::Handle,
+) -> Result<Vec<ModuleEntry>, String> {
+    let lm = rt
+        .block_on(manager.execute_command(Some(session_id), "lm n".to_string()))
+        .map_err(|e| format!("lm n failed: {e}"))?;
+    let mut entries = parse_lm_table(&lm.output);
+    if let Some(needle) = module_filter {
+        let needle = needle.to_ascii_lowercase();
+        entries.retain(|m| m.name.to_ascii_lowercase().contains(&needle));
+    }
+    Ok(entries)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_search(
+    manager: &Arc<HeadlessSessionManager>,
+    session_id: &str,
+    ready_timeout_secs: u64,
+    max_output_chars: usize,
+    rt: &tokio::runtime::Handle,
+    pattern_hex: &str,
+    label: Option<&str>,
+    module_filter: Option<&str>,
+    all: bool,
+    start: Option<&str>,
+    range_len: Option<&str>,
+    max_hits: u32,
+) -> Response {
+    // The wire protocol carries a single hex pattern; the CLI front-end has
+    // already expanded a string query into one Search request per encoding,
+    // so here we search for exactly one needle.
+    let needle = Needle {
+        hex: match parse_hex_pattern(pattern_hex) {
+            Ok(bytes) => bytes_to_hex(&bytes),
+            Err(e) => return Response::err(format!("bad pattern: {e}")),
+        },
+        label: label.unwrap_or("bytes").to_string(),
+    };
+
+    // Make sure we're broken in before touching memory.
+    let was_running = match rt.block_on(manager.query_state(Some(session_id))) {
+        Ok(state) => state.running,
+        Err(error) => return Response::err(format!("query_state: {error}")),
+    };
+    if was_running {
+        if let Err(error) = rt.block_on(manager.interrupt(Some(session_id))) {
+            return Response::err(format!("interrupt: {error}"));
+        }
+    }
+    if let Err(error) =
+        rt.block_on(wait_until_ready_inner(manager, session_id, ready_timeout_secs))
+    {
+        return Response::err(format!("wait-ready: {error}"));
+    }
+
+    // Build the list of (base, len, name) windows to scan.
+    struct Window {
+        base: u64,
+        len: u64,
+        name: String,
+    }
+    let mut windows: Vec<Window> = Vec::new();
+
+    if all {
+        // Whole user address space in one sweep. dbgeng's `s` walks committed
+        // pages and skips unmapped gaps, so this covers private/heap memory
+        // (VirtualAlloc'd regions) without needing symbols or region
+        // enumeration. 0x7FFF_FFFF_FFFF is the top of the x64 user range.
+        windows.push(Window {
+            base: 0,
+            len: 0x7FFF_FFFF_FFFF,
+            name: "user-address-space".to_string(),
+        });
+    } else if let (Some(start), Some(range_len)) = (start, range_len) {
+        // Explicit bounded range.
+        let base = match parse_u64_flexible(start) {
+            Some(v) => v,
+            None => return Response::err(format!("invalid --start `{start}`")),
+        };
+        let len = match parse_u64_flexible(range_len) {
+            Some(v) => v,
+            None => return Response::err(format!("invalid --len `{range_len}`")),
+        };
+        windows.push(Window { base, len, name: "explicit-range".to_string() });
+    } else {
+        // Enumerate module regions.
+        let regions = match collect_search_regions(manager, session_id, module_filter, rt) {
+            Ok(r) => r,
+            Err(e) => return Response::err(e),
+        };
+        if regions.is_empty() {
+            return Response::err(
+                "no regions to search (no modules matched). Use --start/--len for an arbitrary range, or drop --module.".to_string(),
+            );
+        }
+        for m in regions {
+            windows.push(Window {
+                base: m.base,
+                len: m.end.saturating_sub(m.base),
+                name: m.name,
+            });
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "=== search: {} (bytes: {}) across {} region(s) ===\n",
+        needle.label,
+        needle.hex,
+        windows.len()
+    ));
+
+    let mut total_hits = 0u32;
+    let cap = if max_hits == 0 { u32::MAX } else { max_hits };
+    let mut hit_addrs: Vec<String> = Vec::new();
+    let mut stopped_early = false;
+
+    'outer: for w in &windows {
+        if w.len == 0 {
+            continue;
+        }
+        let cmd = format!("s -b 0x{:x} L?0x{:x} {}", w.base, w.len, needle.hex);
+        let result = match rt.block_on(manager.execute_command(Some(session_id), cmd.clone())) {
+            Ok(r) => r,
+            Err(error) => {
+                out.push_str(&format!("  [{}] error: {error}\n", w.name));
+                continue;
+            }
+        };
+        let mut region_hits = 0u32;
+        for line in result.output.lines() {
+            if let Some(addr) = parse_hit_address(line) {
+                region_hits += 1;
+                total_hits += 1;
+                hit_addrs.push(format!("{addr}  ({})", w.name));
+                if total_hits >= cap {
+                    out.push_str(&format!(
+                        "  [{}] {} hit(s) (hit cap {} reached)\n",
+                        w.name, region_hits, cap
+                    ));
+                    stopped_early = true;
+                    break 'outer;
+                }
+            }
+        }
+        if region_hits > 0 {
+            out.push_str(&format!("  [{}] {} hit(s)\n", w.name, region_hits));
+        }
+    }
+
+    out.push_str(&format!("\n=== {total_hits} total hit(s) ===\n"));
+    for addr in &hit_addrs {
+        out.push_str(addr);
+        out.push('\n');
+    }
+    if stopped_early {
+        out.push_str("(stopped at hit cap; raise --max-hits or narrow --module for more)\n");
+    }
+    if was_running {
+        out.push_str("note: target was running before search; left in `break` state.\n");
+    }
+
+    Response::ok(clamp(&out, max_output_chars))
+}
+
+/// Parse a u64 from either "0x..." hex or plain decimal.
+fn parse_u64_flexible(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u64::from_str_radix(&hex.replace('`', ""), 16).ok()
+    } else if t.chars().all(|c| c.is_ascii_digit()) {
+        t.parse().ok()
+    } else {
+        // Bare hex (e.g. an address copied without 0x).
+        u64::from_str_radix(&t.replace('`', ""), 16).ok()
+    }
+}
+
+
 fn execute_simple(
     manager: &Arc<HeadlessSessionManager>,
     session_id: &str,
@@ -1303,7 +1625,7 @@ fn do_action(name: &str, action: &DoAction) -> ExitCode {
         }
     };
 
-    let request = match build_request(action) {
+    let requests = match build_requests(action) {
         Ok(r) => r,
         Err(error) => {
             eprintln!("error: {error}");
@@ -1311,78 +1633,107 @@ fn do_action(name: &str, action: &DoAction) -> ExitCode {
         }
     };
 
-    match send_request(&entry.address, &request) {
-        Ok(resp) => {
-            // Print state header + body.
-            if let Some(state_val) = &resp.state {
-                let status = state_val.get("status_name").and_then(Value::as_str).unwrap_or("?");
-                let raw = state_val.get("raw_status").and_then(Value::as_u64).unwrap_or(0);
-                let ready = state_val
-                    .get("ready_for_commands")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let running = state_val
-                    .get("running")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                eprintln!(
-                    "[state {}/{}, ready={}, running={}]",
-                    status, raw, ready, running
-                );
+    let mut final_code = ExitCode::SUCCESS;
+    for request in &requests {
+        match send_request(&entry.address, request) {
+            Ok(resp) => {
+                // Print state header + body.
+                if let Some(state_val) = &resp.state {
+                    let status = state_val.get("status_name").and_then(Value::as_str).unwrap_or("?");
+                    let raw = state_val.get("raw_status").and_then(Value::as_u64).unwrap_or(0);
+                    let ready = state_val
+                        .get("ready_for_commands")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let running = state_val
+                        .get("running")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    eprintln!(
+                        "[state {}/{}, ready={}, running={}]",
+                        status, raw, ready, running
+                    );
+                }
+                let body = resp.text.trim_end();
+                if !body.is_empty() {
+                    println!("{}", body);
+                }
+                if !resp.ok {
+                    final_code = ExitCode::from(1);
+                }
             }
-            let body = resp.text.trim_end();
-            if !body.is_empty() {
-                println!("{}", body);
+            Err(error) => {
+                eprintln!("daemon `{name}` request failed: {error}");
+                return ExitCode::from(1);
             }
-            if resp.ok { ExitCode::SUCCESS } else { ExitCode::from(1) }
-        }
-        Err(error) => {
-            eprintln!("daemon `{name}` request failed: {error}");
-            ExitCode::from(1)
         }
     }
+    final_code
 }
 
-fn build_request(action: &DoAction) -> Result<Request, String> {
-    Ok(match action {
-        DoAction::State => Request::State,
-        DoAction::Info => Request::Info,
-        DoAction::Go => Request::Go,
-        DoAction::Interrupt => Request::Interrupt,
-        DoAction::WaitBreak { timeout_secs } => Request::WaitBreak { timeout_secs: *timeout_secs },
-        DoAction::Step { count } => Request::Step { count: *count },
-        DoAction::StepOver { count } => Request::StepOver { count: *count },
-        DoAction::StepOut => Request::StepOut,
-        DoAction::StepUntil { address, into } => Request::StepUntil {
+/// Build the wire request(s) for a `do` action. Most actions produce exactly
+/// one request; a string `search` expands into one request per requested
+/// encoding (utf8 / utf16le / gbk), so the caller loops over the result.
+fn build_requests(action: &DoAction) -> Result<Vec<Request>, String> {
+    let single = |r: Request| Ok(vec![r]);
+    match action {
+        DoAction::State => single(Request::State),
+        DoAction::Info => single(Request::Info),
+        DoAction::Go => single(Request::Go),
+        DoAction::Interrupt => single(Request::Interrupt),
+        DoAction::WaitBreak { timeout_secs } => single(Request::WaitBreak { timeout_secs: *timeout_secs }),
+        DoAction::Step { count } => single(Request::Step { count: *count }),
+        DoAction::StepOver { count } => single(Request::StepOver { count: *count }),
+        DoAction::StepOut => single(Request::StepOut),
+        DoAction::StepUntil { address, into } => single(Request::StepUntil {
             address: address.clone(),
             into: *into,
-        },
-        DoAction::Bp { location, one_shot } => Request::Bp {
+        }),
+        DoAction::Bp { location, one_shot } => single(Request::Bp {
             location: location.clone(),
             one_shot: *one_shot,
-        },
-        DoAction::Ba { address, access, size } => Request::Ba {
+        }),
+        DoAction::Ba { address, access, size } => single(Request::Ba {
             address: address.clone(),
             access: access.clone(),
             size: *size,
-        },
-        DoAction::Bc { id } => Request::Bc { id: id.clone() },
-        DoAction::Bl => Request::Bl,
-        DoAction::Reg { registers } => Request::Reg { registers: registers.clone() },
-        DoAction::Mem { address, format, count } => Request::Mem {
+        }),
+        DoAction::Bc { id } => single(Request::Bc { id: id.clone() }),
+        DoAction::Bl => single(Request::Bl),
+        DoAction::Reg { registers } => single(Request::Reg { registers: registers.clone() }),
+        DoAction::Mem { address, format, count } => single(Request::Mem {
             address: address.clone(),
             format: format.clone(),
             count: *count,
-        },
-        DoAction::Dis { address, count } => Request::Dis {
+        }),
+        DoAction::Dis { address, count } => single(Request::Dis {
             address: address.clone(),
             count: *count,
-        },
-        DoAction::Bt { format, count } => Request::Bt {
+        }),
+        DoAction::Bt { format, count } => single(Request::Bt {
             format: format.clone(),
             count: *count,
-        },
-        DoAction::Snapshot => Request::Snapshot,
+        }),
+        DoAction::Snapshot => single(Request::Snapshot),
+        DoAction::Search {
+            bytes,
+            string,
+            encoding,
+            all,
+            module,
+            start,
+            len,
+            max_hits,
+        } => build_search_requests(
+            bytes.as_deref(),
+            string.as_deref(),
+            encoding,
+            *all,
+            module.as_deref(),
+            start.as_deref(),
+            len.as_deref(),
+            *max_hits,
+        ),
         DoAction::Dump {
             out_dir,
             no_minidump,
@@ -1399,23 +1750,165 @@ fn build_request(action: &DoAction) -> Result<Request, String> {
                     .map(|d| d.join(out_dir))
                     .unwrap_or_else(|_| out_dir.clone())
             };
-            Request::Dump {
+            single(Request::Dump {
                 out_dir: resolved.to_string_lossy().into_owned(),
                 minidump: !*no_minidump,
                 modules: !*no_modules,
                 module_filter: module_filter.clone(),
                 resume_after: *resume_after,
-            }
+            })
         }
         DoAction::Exec { command } => {
             let joined = command.join(" ");
             if joined.trim().is_empty() {
                 return Err("missing command for `do exec`".into());
             }
-            Request::Exec { command: joined }
+            single(Request::Exec { command: joined })
         }
-    })
+    }
 }
+
+/// Expand a `search` action into one `Request::Search` per needle. A `--bytes`
+/// pattern yields a single needle; a `--string` yields one needle per selected
+/// encoding so ASCII, wide-char (UTF-16LE) and Chinese (GBK) are all covered.
+fn build_search_requests(
+    bytes: Option<&str>,
+    string: Option<&str>,
+    encoding: &str,
+    all: bool,
+    module: Option<&str>,
+    start: Option<&str>,
+    len: Option<&str>,
+    max_hits: u32,
+) -> Result<Vec<Request>, String> {
+    if bytes.is_some() && string.is_some() {
+        return Err("provide only one of --bytes or --string".into());
+    }
+    // Validate explicit-range pairing early.
+    match (start, len) {
+        (Some(_), Some(_)) | (None, None) => {}
+        _ => return Err("--start and --len must be used together".into()),
+    }
+    // Scope flags are mutually exclusive with each other in spirit; --all wins
+    // and ignores --module, and an explicit range wins over both.
+    if all && start.is_some() {
+        return Err("--all cannot be combined with --start/--len".into());
+    }
+
+    let mut needles: Vec<(String, String)> = Vec::new(); // (pattern_hex, label)
+
+    if let Some(bytes) = bytes {
+        let parsed = parse_hex_pattern(bytes)?;
+        needles.push((bytes_to_hex(&parsed), format!("bytes \"{bytes}\"")));
+    } else if let Some(text) = string {
+        if text.is_empty() {
+            return Err("--string cannot be empty".into());
+        }
+        let encs = parse_encodings(encoding)?;
+        for enc in encs {
+            let (raw, ok) = enc.encode_bytes(text);
+            if !ok {
+                // Skip encodings that cannot represent the text (e.g. Chinese
+                // in nothing — but note it so the user understands coverage).
+                continue;
+            }
+            if raw.is_empty() {
+                continue;
+            }
+            needles.push((bytes_to_hex(&raw), format!("{} \"{}\"", enc.label(), text)));
+        }
+        if needles.is_empty() {
+            return Err(format!(
+                "could not encode `{text}` in any of the requested encodings ({encoding})"
+            ));
+        }
+    } else {
+        return Err("provide --bytes <hex> or --string <text>".into());
+    }
+
+    let requests = needles
+        .into_iter()
+        .map(|(hex, label)| Request::Search {
+            pattern_hex: hex,
+            label: Some(label),
+            module_filter: module.map(str::to_string),
+            all,
+            start: start.map(str::to_string),
+            range_len: len.map(str::to_string),
+            max_hits,
+        })
+        .collect();
+    Ok(requests)
+}
+
+/// A text encoding the search front-end can produce bytes for.
+#[derive(Clone, Copy)]
+enum SearchEncoding {
+    Utf8,
+    Utf16Le,
+    Gbk,
+}
+
+impl SearchEncoding {
+    fn label(self) -> &'static str {
+        match self {
+            SearchEncoding::Utf8 => "utf8",
+            SearchEncoding::Utf16Le => "utf16le",
+            SearchEncoding::Gbk => "gbk",
+        }
+    }
+
+    /// Encode `text`; returns (bytes, had_no_unmappable). For UTF-16LE we emit
+    /// little-endian code units (the Windows wide-char layout).
+    fn encode_bytes(self, text: &str) -> (Vec<u8>, bool) {
+        match self {
+            SearchEncoding::Utf8 => (text.as_bytes().to_vec(), true),
+            SearchEncoding::Utf16Le => {
+                let mut out = Vec::with_capacity(text.len() * 2);
+                for unit in text.encode_utf16() {
+                    out.extend_from_slice(&unit.to_le_bytes());
+                }
+                (out, true)
+            }
+            SearchEncoding::Gbk => {
+                let (encoded, _, had_errors) = encoding_rs::GBK.encode(text);
+                (encoded.into_owned(), !had_errors)
+            }
+        }
+    }
+}
+
+/// Parse a `--encoding` value: `all`, or a comma/space separated list of
+/// `utf8` / `utf16le` (aka `utf16`, `unicode`, `wide`) / `gbk` (aka `ansi`).
+fn parse_encodings(spec: &str) -> Result<Vec<SearchEncoding>, String> {
+    let spec = spec.trim().to_ascii_lowercase();
+    if spec.is_empty() || spec == "all" {
+        return Ok(vec![
+            SearchEncoding::Utf8,
+            SearchEncoding::Utf16Le,
+            SearchEncoding::Gbk,
+        ]);
+    }
+    let mut out = Vec::new();
+    for tok in spec.split([',', ' ', '|']).filter(|t| !t.is_empty()) {
+        let enc = match tok {
+            "utf8" | "utf-8" | "ascii" => SearchEncoding::Utf8,
+            "utf16" | "utf16le" | "utf-16" | "utf-16le" | "unicode" | "wide" => {
+                SearchEncoding::Utf16Le
+            }
+            "gbk" | "gb2312" | "gb18030" | "ansi" | "cn" => SearchEncoding::Gbk,
+            other => return Err(format!("unknown encoding `{other}` (use utf8/utf16le/gbk/all)")),
+        };
+        if !out.iter().any(|e: &SearchEncoding| e.label() == enc.label()) {
+            out.push(enc);
+        }
+    }
+    if out.is_empty() {
+        return Err("no valid encodings in --encoding".into());
+    }
+    Ok(out)
+}
+
 
 fn send_request(address: &str, request: &Request) -> Result<Response, String> {
     windbg_mcp_rs::daemon::send_request(address, request)

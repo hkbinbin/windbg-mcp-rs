@@ -132,6 +132,32 @@ pub enum Request {
     Dis { address: String, count: u32 },
     Bt { format: String, count: u32 },
     Snapshot,
+    /// Search committed, readable memory regions for a raw byte pattern.
+    ///
+    /// The pattern is always a hex byte string (e.g. "48 8b 05"); the CLI
+    /// converts text queries to bytes for the requested encoding(s) before
+    /// sending, so the daemon only ever searches for bytes and never has to
+    /// deal with character encodings on the wire.
+    Search {
+        /// One or more space-separated hex bytes, e.g. "50 61 73 73".
+        pattern_hex: String,
+        /// Optional label describing what these bytes came from (e.g.
+        /// "utf16le \"密码\""), echoed in the result header.
+        label: Option<String>,
+        /// Restrict the search to modules whose name contains this substring
+        /// (case-insensitive). When None, search all committed regions.
+        module_filter: Option<String>,
+        /// Scan the entire user address space (private memory included) in a
+        /// single `s` sweep instead of enumerating module ranges.
+        all: bool,
+        /// Explicit start address (hex). Overrides region enumeration when set
+        /// together with `range_len`.
+        start: Option<String>,
+        /// Explicit byte length for an explicit-range search (hex or decimal).
+        range_len: Option<String>,
+        /// Stop after this many total hits (0 = unlimited).
+        max_hits: u32,
+    },
     Dump {
         out_dir: String,
         minidump: bool,

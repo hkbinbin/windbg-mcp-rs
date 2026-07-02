@@ -5,14 +5,16 @@ description: >-
   windbg-mcp-rs MCP server. Use this when the user wants to debug a Windows
   user-mode process or kernel (KDNET) target via this project's tools — open a
   session, set breakpoints, step, read registers/memory, disassemble, capture a
-  backtrace, dump a process, or run raw WinDbg commands. Triggers include:
-  "debug notepad", "attach to PID", "set a breakpoint with windbg_cli",
-  "windbg daemon", "open a kernel session", "dump this process", "run a WinDbg
-  command through the daemon".
+  backtrace, search memory for bytes/strings (incl. Chinese and whole-address
+  -space `--all` scans), dump a process, or run raw WinDbg commands. Triggers
+  include: "debug notepad", "attach to PID", "set a breakpoint with windbg_cli",
+  "windbg daemon", "open a kernel session", "search memory for a string/secret",
+  "find bytes in the process", "dump this process", "run a WinDbg command
+  through the daemon".
 metadata:
   agent_created: true
   project: windbg-mcp-rs
-  version: "0.2.1"
+  version: "0.2.2"
 ---
 
 # windbg-cli
@@ -146,7 +148,53 @@ command body is on stdout.
 | `dump --out-dir <DIR> [--no-minidump] [--no-modules] [--module-filter <substr>] [--resume-after]` | Full `/ma` minidump (`process.dmp`) + per-module raw bytes under `modules/`. Auto-interrupts if running. | `do --name dbg dump --out-dir C:\\dumps\\app --no-modules` |
 | `exec <RAW WINDBG CMD>` | Any raw WinDbg command. Quote if it has spaces. | `do --name dbg exec "u @rip L8"` |
 
+### Memory search (`do search`)
+
+Search process memory for a byte pattern or a string, aggregating hit
+addresses. Provide **exactly one** of `--bytes` or `--string`.
+
+| Flag | Meaning |
+|---|---|
+| `--bytes "<hex>"` | Byte pattern, space/comma-separated hex (`"48 8b 05"` or `48,8b,05`). |
+| `--string "<text>"` | Text to find. Converted to bytes **inside the CLI** per `--encoding` — so Chinese/multibyte never gets mangled by the command line. |
+| `--encoding <enc>` | For `--string`: `utf8`, `utf16le` (Windows wide), `gbk` (Chinese ANSI), or `all` (default). Comma-separated ok. Each encoding runs as a separate search. |
+| `--all` | Scan the **whole user address space**, including private/heap/VirtualAlloc'd memory. Use this to find secrets that are NOT in any module image (injected payloads, decrypted buffers). dbgeng skips unmapped pages, so it's fast. |
+| `--module <substr>` | Restrict to modules whose name contains `<substr>` (case-insensitive). |
+| `--start <hex> --len <hex\|dec>` | Search an explicit range (heap/stack/arbitrary VA). Must be used together. |
+| `--max-hits <N>` | Cap total hits (default 256; `0` = unlimited). |
+
+Scope (mutually exclusive): default scans every loaded module's image range
+(via `lm`, no symbols needed); `--all` sweeps the entire user address space —
+this is how you find private-memory secrets when you don't know the address;
+`--module` narrows to matching modules; `--start`/`--len` targets one explicit
+window. `--all` cannot combine with `--start`.
+
+Examples:
+
+```bash
+# Byte pattern across a specific module
+windbg_cli do --name dbg search --bytes "48 8b 05" --module notepad
+
+# ASCII string, wide (UTF-16LE) string, or both — Windows UI text is wide
+windbg_cli do --name dbg search --string "Notepad" --encoding utf16le --module notepad
+
+# Chinese string, all encodings (utf8 + utf16le + gbk) — one search each
+windbg_cli do --name dbg search --string "密码" --encoding all
+
+# Find a secret hidden in PRIVATE memory (address unknown) — scan everything
+windbg_cli do --name dbg search --string "顶级机密令牌" --encoding utf16le --all
+
+# Arbitrary range (e.g. a heap block you found), unlimited hits
+windbg_cli do --name dbg search --bytes "de ad be ef" --start 0x1e0f6ec0000 --len 0x10000 --max-hits 0
+```
+
+Output lists per-region hit counts and every hit address with its region name.
+
 ## Important conventions & gotchas
+
+- **Search Chinese/wide strings via `do search --string`, not `exec "s ..."`.**
+  Multibyte text passed on the raw command line gets corrupted; `do search`
+  converts text → bytes in Rust first, so UTF-16LE / GBK / UTF-8 are exact.
 
 - **`reg` with multiple registers**, not a raw `r rip rax rcx`: the engine
   **blocks** fragile multi-register `r` reads (they cause transient dbgeng

@@ -96,8 +96,9 @@ fn section_do() -> String {
     s.push_str("------------------------------------------\n");
     s.push_str("Use the CLI directly: `windbg_cli do --name <name> <action>`. Actions include:\n");
     s.push_str("  state | go | interrupt | wait-break | step | step-over | step-out | step-until\n");
-    s.push_str("  bp | ba | bc | bl | reg | mem | dis | bt | snapshot | dump | exec | info\n");
+    s.push_str("  bp | ba | bc | bl | reg | mem | dis | bt | snapshot | search | dump | exec | info\n");
     s.push_str("`exec` runs a raw WinDbg command, e.g. `windbg_cli do --name <name> exec \"u @rip L8\"`.\n");
+    s.push_str("`search` finds bytes or strings in memory, e.g. `windbg_cli do --name <name> search --string \"密码\" --encoding all`.\n");
     s.push_str("Run `windbg_cli do --help` for exact flags of each action.\n");
     s
 }

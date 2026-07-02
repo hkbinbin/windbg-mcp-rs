@@ -1,0 +1,25 @@
+[package]
+name = "secret-search-demo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone demo — intentionally NOT part of the main crate's build.
+# Build with:  cargo build --release   (run inside this folder)
+
+[lib]
+name = "secret_dll"
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "secret_host"
+path = "src/bin/secret_host.rs"
+
+[dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
